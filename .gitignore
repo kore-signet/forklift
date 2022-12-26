@@ -1,0 +1,4 @@
+/target
+idx
+*.warc.*
+*.txt
