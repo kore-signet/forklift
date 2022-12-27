@@ -1,21 +1,21 @@
 use bytes::{BufMut, BytesMut};
 use hyper::{
-    body::{Bytes, HttpBody},
+    body::Bytes,
     client::connect::HttpInfo,
     header::{CONTENT_TYPE, LOCATION},
-    http::HeaderValue,
-    Body, HeaderMap, Response,
+    http::{response::Parts as ResponseParts, HeaderValue},
+    HeaderMap,
 };
 use rkyv::{Archive, Deserialize, Serialize};
 
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
-use crate::{ForkliftError, ForkliftResult};
+use crate::ForkliftResult;
 
-const MAX_RESPONSE_SIZE: usize = 8000000000;
+//const MAX_RESPONSE_SIZE: usize = 8000000000;
 
-#[derive(Archive, Deserialize, Serialize, Default, Debug)]
+#[derive(Archive, Deserialize, Serialize, Default, Debug, Clone)]
 pub struct CdxRecord {
     pub(crate) timestamp: i128,
     pub(crate) url: String,
@@ -35,7 +35,7 @@ pub struct WarcRecord {
 }
 
 impl WarcRecord {
-    pub(crate) fn into_bytes(self) -> (CdxRecord, Vec<u8>) {
+    pub(crate) fn into_bytes(&self) -> (CdxRecord, Vec<u8>) {
         let mut out: Vec<u8> = Vec::with_capacity(1024 + self.block.len());
         out.extend_from_slice(b"WARC/1.1\r\n");
 
@@ -50,11 +50,12 @@ impl WarcRecord {
 
         out.extend_from_slice(self.block.as_ref());
 
-        (self.metadata, out)
+        (self.metadata.clone(), out)
     }
 
-    pub async fn from_response(
-        mut res: Response<Body>,
+    pub fn from_response(
+        res: &ResponseParts,
+        body: Bytes,
         target_url: &str,
     ) -> ForkliftResult<WarcRecord> {
         let mut cdx = CdxRecord::default();
@@ -79,14 +80,14 @@ impl WarcRecord {
         );
         cdx.timestamp = time.unix_timestamp_nanos();
         cdx.mime = res
-            .headers()
+            .headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_owned());
-        cdx.status = res.status().as_u16();
+        cdx.status = res.status.as_u16();
 
-        cdx.redirect = if res.status().is_redirection() {
-            res.headers()
+        cdx.redirect = if res.status.is_redirection() {
+            res.headers
                 .get(LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.to_owned())
@@ -99,28 +100,27 @@ impl WarcRecord {
             HeaderValue::try_from(format!("<urn:uuid:{}>", Uuid::new_v4().hyphenated())).unwrap(),
         );
 
-        res.extensions().get::<HttpInfo>().map(|info| {
+        res.extensions.get::<HttpInfo>().map(|info| {
             warc_headers.insert(
                 "Warc-IP-Address",
                 HeaderValue::try_from(info.remote_addr().to_string()).unwrap(),
             );
         });
 
-        let mut block =
-            BytesMut::with_capacity(res.size_hint().upper().unwrap_or(0) as usize + 1024);
+        let mut block = BytesMut::with_capacity(body.len() as usize + 1024);
 
         block.extend_from_slice(b"HTTP/1.1 ");
-        block.extend_from_slice(res.status().as_str().as_bytes());
+        block.extend_from_slice(res.status.as_str().as_bytes());
         block.put_u8(b' ');
         block.extend_from_slice(
-            res.status()
+            res.status
                 .canonical_reason()
                 .unwrap_or("<unknown status code>")
                 .as_bytes(),
         );
         block.extend_from_slice(b"\r\n");
 
-        for (name, value) in res.headers().iter() {
+        for (name, value) in res.headers.iter() {
             block.extend_from_slice(name.as_ref());
             block.extend_from_slice(b": ");
             block.extend_from_slice(value.as_bytes());
@@ -130,16 +130,8 @@ impl WarcRecord {
         block.extend_from_slice(b"\r\n");
 
         let payload_start = block.len();
-        let mut seen_body = false;
-
-        while let Some(data) = res.data().await.transpose()? {
-            seen_body = true;
-            block.put(data);
-
-            if block.len() > MAX_RESPONSE_SIZE {
-                return Err(ForkliftError::BodyTooLong);
-            }
-        }
+        let has_body = body.len() > 0;
+        block.put(body);
 
         warc_headers.append(
             "Content-Length",
@@ -148,7 +140,7 @@ impl WarcRecord {
 
         Ok(WarcRecord {
             headers: warc_headers,
-            payload_start: if seen_body { payload_start } else { 0 },
+            payload_start: if has_body { payload_start } else { 0 },
             block: block.freeze(),
             metadata: cdx,
         })

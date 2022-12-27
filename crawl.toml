@@ -1,0 +1,15 @@
+base_url = "https://cat-girl.gay"
+http_workers = 4
+tasks_per_http_worker = 16
+writer_tasks = 2
+script_tasks = 2
+
+[scripts.html]
+filter = { mime_types = ["text/html"] }
+command = "python"
+args = ["scripts/scrape_html.py"] 
+
+[scripts.links]
+filter = { mime_types = ["text/css"] }
+command = "python"
+args = ["scripts/scrape_css.py"] 

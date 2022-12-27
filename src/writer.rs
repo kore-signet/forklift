@@ -3,21 +3,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use async_channel::{Receiver, Sender};
-
 use hyper::http::HeaderValue;
 use miniz_oxide::deflate::{
     self,
     core::{create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus},
 };
 use sha2::{Digest, Sha256};
-use url::Url;
 
 use crate::{warc::WarcRecord, ForkliftResult};
 
 pub struct RecordProcessor<W: Write + Seek> {
-    record_rx: Receiver<WarcRecord>,
-    url_tx: Sender<Url>,
     compression_buffer: Vec<u8>,
     hasher: Sha256,
     db: sled::Db,
@@ -29,13 +24,9 @@ impl<W: Write + Seek> RecordProcessor<W> {
     pub fn new(
         compress_level: u8,
         db: sled::Db,
-        record_rx: Receiver<WarcRecord>,
-        url_tx: Sender<Url>,
         writer: Arc<Mutex<BufWriter<W>>>,
-    ) -> RecordProcessor<W> {
-        RecordProcessor {
-            record_rx,
-            url_tx,
+    ) -> ForkliftResult<RecordProcessor<W>> {
+        Ok(RecordProcessor {
             compression_buffer: Vec::with_capacity(1_000_000),
             hasher: Sha256::new(),
             db,
@@ -45,16 +36,7 @@ impl<W: Write + Seek> RecordProcessor<W> {
                 0,
                 0,
             )),
-        }
-    }
-
-    pub fn run(&mut self) -> ForkliftResult<()> {
-        // todo! file switching
-        while let Some(record) = self.record_rx.recv_blocking().ok() {
-            self.write(record)?;
-        }
-
-        Ok(())
+        })
     }
 
     fn compress(&mut self, record: &[u8]) {
@@ -118,7 +100,7 @@ impl<W: Write + Seek> RecordProcessor<W> {
         self.compressor.reset();
     }
 
-    fn write(&mut self, mut record: WarcRecord) -> ForkliftResult<()> {
+    pub fn add_record(&mut self, mut record: WarcRecord) -> ForkliftResult<()> {
         self.add_digest(&mut record);
 
         let (mut cdx, mut record) = record.into_bytes();

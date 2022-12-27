@@ -1,64 +1,89 @@
-use crate::{warc::WarcRecord, ForkliftResult};
-use async_channel::{Receiver, Sender};
+use crate::{ForkliftResult, TransferResponse, UrlSource};
+use async_channel::Sender;
+
 use hyper::{client::HttpConnector, header::LOCATION, Body, Client, HeaderMap, Request};
 use hyper_tls::HttpsConnector;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::JoinSet};
 use url::Url;
 
 type HttpsConn = HttpsConnector<HttpConnector>;
 
-const TASK_MAX: usize = 16;
-
 pub struct HttpClient {
-    db: sled::Db,
-    url_rx: Receiver<Url>,
-    url_tx: Sender<Url>,
-    record_tx: Sender<WarcRecord>,
-    headers: HeaderMap,
-    client: Client<HttpsConn>,
-    semaphore: Semaphore,
+    inner: Arc<HttpClientInner>,
+    tasks: JoinSet<ForkliftResult<()>>,
+    semaphore: Arc<Semaphore>,
+    task_max: usize,
 }
 
 impl HttpClient {
     pub fn new(
-        db: sled::Db,
+        db: sled::Tree,
         client: Client<HttpsConn>,
-        url_tx: Sender<Url>,
-        url_rx: Receiver<Url>,
-        record_tx: Sender<WarcRecord>,
+        url_tx: Sender<UrlSource>,
+        record_tx: Sender<TransferResponse>,
         headers: HeaderMap,
+        semaphore: Arc<Semaphore>,
+        task_max: usize,
     ) -> HttpClient {
+        semaphore.add_permits(task_max);
         HttpClient {
+            inner: Arc::new(HttpClientInner::new(db, client, url_tx, record_tx, headers)),
+            tasks: JoinSet::new(),
+            semaphore,
+            task_max,
+        }
+    }
+
+    pub async fn add_task(&mut self, task: UrlSource) -> ForkliftResult<()> {
+        if self.tasks.len() == self.task_max {
+            self.tasks.join_next().await.unwrap()??;
+        }
+
+        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+        let client = Arc::clone(&self.inner);
+        self.tasks.spawn(async move {
+            client.process_one(task).await?;
+            drop(permit);
+            ForkliftResult::Ok(())
+        });
+
+        ForkliftResult::Ok(())
+    }
+}
+
+pub struct HttpClientInner {
+    db: sled::Tree,
+    url_tx: Sender<UrlSource>,
+    record_tx: Sender<TransferResponse>,
+    headers: HeaderMap,
+    client: Client<HttpsConn>,
+}
+
+impl HttpClientInner {
+    pub fn new(
+        db: sled::Tree,
+        client: Client<HttpsConn>,
+        url_tx: Sender<UrlSource>,
+        record_tx: Sender<TransferResponse>,
+        headers: HeaderMap,
+    ) -> HttpClientInner {
+        HttpClientInner {
             db,
-            url_rx,
             url_tx,
             record_tx,
             headers,
             client,
-            semaphore: Semaphore::new(TASK_MAX),
         }
-    }
-
-    pub async fn run(self) -> ForkliftResult<()> {
-        let arc_self = Arc::new(self);
-
-        while let Some(next_uri) = arc_self.url_rx.recv().await.ok() {
-            let arc = Arc::clone(&arc_self);
-            tokio::task::spawn(async move {
-                let permit = arc.semaphore.acquire().await.unwrap();
-                (&arc).process_one(next_uri).await;
-                drop(permit);
-            });
-        }
-
-        Ok(())
     }
 
     // this should only be run in a task!
-    pub async fn process_one(&self, uri: Url) -> ForkliftResult<()> {
-        let uri_s = uri.to_string();
-        let mut request = Request::get(uri.as_str()).body(Body::empty()).unwrap();
+    pub async fn process_one(&self, uri: UrlSource) -> ForkliftResult<()> {
+        let uri_s = uri.current_url.to_string();
+
+        let mut request = Request::get(uri.current_url.as_str())
+            .body(Body::empty())
+            .unwrap();
         let headers = request.headers_mut();
         headers.reserve(self.headers.len());
 
@@ -74,16 +99,24 @@ impl HttpClient {
                 .and_then(|v| v.to_str().ok())
                 .filter(|v| !self.db.contains_key(*v).unwrap())
                 .and_then(|v| v.parse::<Url>().ok())
+                .map(|url| UrlSource {
+                    hops_external: uri.hops_external,
+                    redirect_hops: uri.redirect_hops + 1,
+                    current_url: url,
+                    source_url: Some(uri.current_url.clone()),
+                })
         } else {
             None
         };
 
-        let record = WarcRecord::from_response(res, &uri_s).await?;
+        self.db.insert(uri_s, &[])?;
+        let resp = TransferResponse::from_response(res, uri).await?;
 
+        #[allow(unused_must_use)]
         if let Some(next_uri) = next_uri {
-            tokio::join![self.record_tx.send(record), self.url_tx.send(next_uri)];
+            tokio::join![self.record_tx.send(resp), self.url_tx.send(next_uri)];
         } else {
-            self.record_tx.send(record).await;
+            self.record_tx.send(resp).await;
         }
 
         Ok(())
