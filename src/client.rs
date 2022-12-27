@@ -3,7 +3,7 @@ use async_channel::Sender;
 
 use hyper::{client::HttpConnector, header::LOCATION, Body, Client, HeaderMap, Request};
 use hyper_tls::HttpsConnector;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, task::JoinSet};
 use url::Url;
 
@@ -14,6 +14,7 @@ pub struct HttpClient {
     tasks: JoinSet<ForkliftResult<()>>,
     semaphore: Arc<Semaphore>,
     task_max: usize,
+    timeout: Duration,
 }
 
 impl HttpClient {
@@ -25,6 +26,7 @@ impl HttpClient {
         headers: HeaderMap,
         semaphore: Arc<Semaphore>,
         task_max: usize,
+        timeout: Duration,
     ) -> HttpClient {
         semaphore.add_permits(task_max);
         HttpClient {
@@ -32,18 +34,33 @@ impl HttpClient {
             tasks: JoinSet::new(),
             semaphore,
             task_max,
+            timeout,
         }
     }
 
     pub async fn add_task(&mut self, task: UrlSource) -> ForkliftResult<()> {
-        if self.tasks.len() == self.task_max {
-            self.tasks.join_next().await.unwrap()??;
+        if self.tasks.len() == self.task_max - 1 {
+            self.tasks.join_next().await;
         }
+
+        log::debug!(
+            "getting {} | current tasks {}",
+            task.current_url,
+            self.tasks.len()
+        );
 
         let permit = self.semaphore.clone().acquire_owned().await.unwrap();
         let client = Arc::clone(&self.inner);
+        let timeout = self.timeout.clone();
         self.tasks.spawn(async move {
-            client.process_one(task).await?;
+            match tokio::time::timeout(timeout, client.process_one(task.clone())).await {
+                Ok(v) => v?,
+                Err(_) => log::error!(
+                    "url {} timed out after {:?}",
+                    task.current_url.as_str(),
+                    timeout
+                ),
+            }
             drop(permit);
             ForkliftResult::Ok(())
         });

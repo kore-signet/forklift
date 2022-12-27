@@ -1,5 +1,7 @@
 use std::{
+    fs::File,
     io::{BufWriter, Seek, Write},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -9,22 +11,134 @@ use miniz_oxide::deflate::{
     core::{create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus},
 };
 use sha2::{Digest, Sha256};
+use time::{
+    format_description::well_known::{
+        iso8601::{self, TimePrecision},
+        Iso8601,
+    },
+    OffsetDateTime,
+};
 
-use crate::{warc::WarcRecord, ForkliftResult};
+use crate::{warc::WarcRecord, ForkliftError, ForkliftResult};
 
-pub struct RecordProcessor<W: Write + Seek> {
+const WARC_FILENAME_TIMESTAMP_FORMAT: iso8601::EncodedConfig = iso8601::Config::DEFAULT
+    .set_time_precision(TimePrecision::Second {
+        decimal_digits: None,
+    })
+    .set_offset_precision(iso8601::OffsetPrecision::Hour)
+    .set_use_separators(false)
+    .encode();
+
+pub trait WARCOutput {
+    fn position(&mut self) -> ForkliftResult<u64>;
+    fn write_record(&mut self, record: &[u8]) -> ForkliftResult<()>;
+}
+
+impl<T> WARCOutput for T
+where
+    T: Write + Seek,
+{
+    #[inline]
+    fn position(&mut self) -> ForkliftResult<u64> {
+        self.stream_position().map_err(ForkliftError::IOError)
+    }
+
+    #[inline]
+    fn write_record(&mut self, record: &[u8]) -> ForkliftResult<()> {
+        self.write_all(record).map_err(ForkliftError::IOError)
+    }
+}
+
+pub struct WARCFileOutput {
+    writer: Option<BufWriter<File>>,
+    byte_counter: u64,
+    file_size_for_rotation: u64,
+    warc_path: PathBuf,
+    warc_prefix: String,
+    file_counter: usize,
+}
+
+impl WARCFileOutput {
+    pub fn new(
+        path: impl AsRef<Path>,
+        warc_prefix: impl AsRef<str>,
+        file_size_for_rotation: u64,
+    ) -> ForkliftResult<WARCFileOutput> {
+        let mut out = WARCFileOutput {
+            writer: None,
+            byte_counter: 0,
+            file_size_for_rotation,
+            warc_path: path.as_ref().to_owned(),
+            warc_prefix: warc_prefix.as_ref().to_owned(),
+            file_counter: 0,
+        };
+
+        out.rotate()?;
+
+        Ok(out)
+    }
+
+    fn rotate(&mut self) -> ForkliftResult<()> {
+        self.byte_counter = 0;
+        self.file_counter += 1;
+
+        let path = self.warc_path.join(format!(
+            "{prefix}-{timestamp}-{filecounter:07}.warc.gz",
+            prefix = &self.warc_prefix,
+            timestamp = OffsetDateTime::now_utc()
+                .format(&Iso8601::<WARC_FILENAME_TIMESTAMP_FORMAT>)
+                .unwrap(),
+            filecounter = self.file_counter
+        ));
+
+        self.writer = Some(BufWriter::new(File::create(path)?));
+
+        Ok(())
+    }
+}
+
+impl WARCOutput for WARCFileOutput {
+    #[inline]
+    fn position(&mut self) -> ForkliftResult<u64> {
+        self.writer
+            .as_mut()
+            .unwrap()
+            .stream_position()
+            .map_err(ForkliftError::IOError)
+    }
+
+    #[inline]
+    fn write_record(&mut self, record: &[u8]) -> ForkliftResult<()> {
+        self.writer.as_mut().unwrap().write_all(record)?;
+
+        self.byte_counter += record.len() as u64;
+        if self.byte_counter > self.file_size_for_rotation {
+            let mut writer = self.writer.take().unwrap();
+            writer.flush()?;
+            let file = writer.into_inner().unwrap();
+            file.sync_all()?;
+            drop(file);
+
+            self.rotate()?;
+        }
+
+        Ok(())
+    }
+}
+
+pub struct RecordProcessor<W: WARCOutput> {
     compression_buffer: Vec<u8>,
     hasher: Sha256,
     db: sled::Db,
-    writer: Arc<Mutex<BufWriter<W>>>,
+    writer: Arc<Mutex<W>>,
     compressor: CompressorOxide,
 }
 
-impl<W: Write + Seek> RecordProcessor<W> {
+impl<W: WARCOutput> RecordProcessor<W> {
     pub fn new(
         compress_level: u8,
         db: sled::Db,
-        writer: Arc<Mutex<BufWriter<W>>>,
+        writer: Arc<Mutex<W>>,
     ) -> ForkliftResult<RecordProcessor<W>> {
         Ok(RecordProcessor {
             compression_buffer: Vec::with_capacity(1_000_000),
@@ -111,11 +225,10 @@ impl<W: Write + Seek> RecordProcessor<W> {
 
         let mut output = self.writer.lock().unwrap();
 
-        cdx.offset = output.stream_position()?;
+        cdx.offset = output.position()?;
 
         let len = record.len();
-        output.write_all(&self.compression_buffer)?;
-        output.flush()?;
+        output.write_record(&self.compression_buffer)?;
         drop(output);
 
         cdx.length = len as u64;

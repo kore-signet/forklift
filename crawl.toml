@@ -1,8 +1,25 @@
+folder = "catgirl-crawl"
+
+[crawl]
 base_url = "https://cat-girl.gay"
-http_workers = 4
-tasks_per_http_worker = 16
-writer_tasks = 2
-script_tasks = 2
+urls_file = "cat-girl.txt"
+
+[http]
+workers = 4
+tasks_per_worker = 16
+
+[output]
+workers = 2
+file_prefix = "catgirl-gay-"
+file_size = "1GB"
+
+[index]
+compression = true
+compression_level = 5
+overwrite = true
+
+[script_manager]
+workers = 2
 
 [scripts.html]
 filter = { mime_types = ["text/html"] }
