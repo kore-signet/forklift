@@ -18,8 +18,13 @@ use time::{
     },
     OffsetDateTime,
 };
+use url::Url;
 
-use crate::{warc::WarcRecord, ForkliftError, ForkliftResult};
+use crate::{
+    surt,
+    warc::{CdxRecord, WarcRecord},
+    ForkliftError, ForkliftResult,
+};
 
 const WARC_FILENAME_TIMESTAMP_FORMAT: iso8601::EncodedConfig = iso8601::Config::DEFAULT
     .set_time_precision(TimePrecision::Second {
@@ -31,7 +36,7 @@ const WARC_FILENAME_TIMESTAMP_FORMAT: iso8601::EncodedConfig = iso8601::Config::
 
 pub trait WARCOutput {
     fn position(&mut self) -> ForkliftResult<u64>;
-    fn write_record(&mut self, record: &[u8]) -> ForkliftResult<()>;
+    fn write_record(&mut self, record: &[u8], cdx: &mut CdxRecord) -> ForkliftResult<()>;
 }
 
 impl<T> WARCOutput for T
@@ -44,7 +49,7 @@ where
     }
 
     #[inline]
-    fn write_record(&mut self, record: &[u8]) -> ForkliftResult<()> {
+    fn write_record(&mut self, record: &[u8], _cdx: &mut CdxRecord) -> ForkliftResult<()> {
         self.write_all(record).map_err(ForkliftError::IOError)
     }
 }
@@ -56,6 +61,7 @@ pub struct WARCFileOutput {
     warc_path: PathBuf,
     warc_prefix: String,
     file_counter: usize,
+    current_file_name: Option<String>,
 }
 
 impl WARCFileOutput {
@@ -71,6 +77,7 @@ impl WARCFileOutput {
             warc_path: path.as_ref().to_owned(),
             warc_prefix: warc_prefix.as_ref().to_owned(),
             file_counter: 0,
+            current_file_name: None,
         };
 
         out.rotate()?;
@@ -82,14 +89,17 @@ impl WARCFileOutput {
         self.byte_counter = 0;
         self.file_counter += 1;
 
-        let path = self.warc_path.join(format!(
+        let filename = format!(
             "{prefix}-{timestamp}-{filecounter:07}.warc.gz",
             prefix = &self.warc_prefix,
             timestamp = OffsetDateTime::now_utc()
                 .format(&Iso8601::<WARC_FILENAME_TIMESTAMP_FORMAT>)
                 .unwrap(),
             filecounter = self.file_counter
-        ));
+        );
+
+        let path = self.warc_path.join(&filename);
+        self.current_file_name = Some(filename);
 
         self.writer = Some(BufWriter::new(File::create(path)?));
 
@@ -108,7 +118,8 @@ impl WARCOutput for WARCFileOutput {
     }
 
     #[inline]
-    fn write_record(&mut self, record: &[u8]) -> ForkliftResult<()> {
+    fn write_record(&mut self, record: &[u8], _cdx: &mut CdxRecord) -> ForkliftResult<()> {
+        // todo: add file information to cdx
         self.writer.as_mut().unwrap().write_all(record)?;
 
         self.byte_counter += record.len() as u64;
@@ -217,7 +228,7 @@ impl<W: WARCOutput> RecordProcessor<W> {
     pub fn add_record(&mut self, mut record: WarcRecord) -> ForkliftResult<()> {
         self.add_digest(&mut record);
 
-        let (mut cdx, mut record) = record.into_bytes();
+        let (mut cdx, mut record) = record.as_bytes();
 
         record.extend_from_slice(b"\r\n\r\n");
 
@@ -228,12 +239,14 @@ impl<W: WARCOutput> RecordProcessor<W> {
         cdx.offset = output.position()?;
 
         let len = record.len();
-        output.write_record(&self.compression_buffer)?;
+        output.write_record(&self.compression_buffer, &mut cdx)?;
         drop(output);
 
         cdx.length = len as u64;
         self.db.insert(
-            cdx.url.clone(),
+            Url::parse(&cdx.url)
+                .ok()
+                .map_or_else(|| cdx.url.clone(), surt),
             rkyv::util::to_bytes::<_, 1024>(&cdx).unwrap().as_ref(),
         )?;
 

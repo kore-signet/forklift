@@ -7,24 +7,24 @@ use hyper::{
     HeaderMap,
 };
 use rkyv::{Archive, Deserialize, Serialize};
-
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
 use uuid::Uuid;
 
 use crate::ForkliftResult;
 
 //const MAX_RESPONSE_SIZE: usize = 8000000000;
 
-#[derive(Archive, Deserialize, Serialize, Default, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, serde::Serialize, Default, Debug, Clone)]
 pub struct CdxRecord {
-    pub(crate) timestamp: i128,
-    pub(crate) url: String,
-    pub(crate) mime: Option<String>,
-    pub(crate) status: u16,
-    pub(crate) length: u64,
-    pub(crate) offset: u64,
-    pub(crate) redirect: Option<String>,
-    pub(crate) filename: String,
+    pub timestamp: i128,
+    pub url: String,
+    pub mime: Option<String>,
+    pub status: u16,
+    pub length: u64,
+    pub offset: u64,
+    pub redirect: Option<String>,
+    pub filename: Option<String>,
 }
 
 pub struct WarcRecord {
@@ -35,7 +35,7 @@ pub struct WarcRecord {
 }
 
 impl WarcRecord {
-    pub(crate) fn into_bytes(&self) -> (CdxRecord, Vec<u8>) {
+    pub(crate) fn as_bytes(&self) -> (CdxRecord, Vec<u8>) {
         let mut out: Vec<u8> = Vec::with_capacity(1024 + self.block.len());
         out.extend_from_slice(b"WARC/1.1\r\n");
 
@@ -107,7 +107,7 @@ impl WarcRecord {
             );
         });
 
-        let mut block = BytesMut::with_capacity(body.len() as usize + 1024);
+        let mut block = BytesMut::with_capacity(body.len() + 1024);
 
         block.extend_from_slice(b"HTTP/1.1 ");
         block.extend_from_slice(res.status.as_str().as_bytes());
@@ -130,7 +130,7 @@ impl WarcRecord {
         block.extend_from_slice(b"\r\n");
 
         let payload_start = block.len();
-        let has_body = body.len() > 0;
+        let has_body = !body.is_empty();
         block.put(body);
 
         warc_headers.append(

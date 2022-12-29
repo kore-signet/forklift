@@ -8,6 +8,9 @@ urls_file = "cat-girl.txt"
 workers = 4
 tasks_per_worker = 16
 
+[http.headers]
+"User-Agent" = "Mozilla/5.0 (X11; Linux x86_64; rv:92.0) Gecko/20100101 Firefox/92.0"
+
 [output]
 workers = 2
 file_prefix = "catgirl-gay-"

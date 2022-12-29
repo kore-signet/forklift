@@ -1,14 +1,12 @@
 import re
 import sys
-from base import run_scraper
+from base import run
 
 url_expression = re.compile(r"""url\((?!['"]?(?:data):)['"]?([^'"\)]*)['"]?\)""")
 
-def scrape(inp, out):
+async def scrape(scraper, url, inp):
     inp = inp.decode("utf8")
     for match in url_expression.finditer(inp):
-        out.write(match.group(1).encode("utf8"))
-        out.write(b"\n")
+        scraper.submit_url(match.group(1))
 
-
-run_scraper(scrape)
+run(scrape)

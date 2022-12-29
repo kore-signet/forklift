@@ -6,10 +6,10 @@ use forklift::{
     scripting::ScriptManager,
     warc::WarcRecord,
     writer::{RecordProcessor, WARCFileOutput},
-    ForkliftError, ForkliftResult, TransferResponse, UrlSource,
+    ForkliftError, ForkliftResult, HttpJob, TransferResponse, UrlSource,
 };
 use futures::TryFutureExt;
-use hyper::{Client, HeaderMap};
+use hyper::Client;
 use hyper_tls::HttpsConnector;
 
 use std::time::Duration;
@@ -22,11 +22,32 @@ use url::Url;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    inner_main().await
+}
+
+async fn inner_main() -> anyhow::Result<()> {
     pretty_env_logger::init();
 
     let mut config: ForkliftConfig =
-        toml::from_str(&std::fs::read_to_string(std::env::args().skip(1).next().unwrap()).unwrap())
+        toml::from_str(&std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap())
             .unwrap();
+
+    let (url_tx, url_rx) = async_channel::bounded::<UrlSource>(1024 * 8);
+    let (http_job_tx, http_job_rx) = async_channel::bounded::<HttpJob>(1024 * 8);
+    let (response_tx, response_rx) = async_channel::bounded::<TransferResponse>(256);
+    let (record_tx, record_rx) = async_channel::bounded::<TransferResponse>(256);
+    let (script_tx, script_rx) = async_channel::bounded::<TransferResponse>(256);
+    let (script_close_tx, script_close_rx) = tokio::sync::watch::channel(false);
+
+    let mut output_folder = config.folder.join("warcs");
+    tokio::fs::create_dir_all(&output_folder).await?;
+    output_folder = tokio::fs::canonicalize(output_folder).await?;
+
+    tokio::fs::write(
+        config.folder.join("config.json"),
+        serde_json::to_vec(&config)?,
+    )
+    .await?;
 
     if config.scripts.is_empty() {
         config.script_manager.workers = 0;
@@ -38,15 +59,6 @@ async fn main() -> anyhow::Result<()> {
     if config.index.overwrite {
         seen_url_db.clear()?;
     }
-
-    let (url_tx, url_rx) = async_channel::bounded::<UrlSource>(1024 * 8);
-    let (response_tx, response_rx) = async_channel::bounded::<TransferResponse>(256);
-    let (record_tx, record_rx) = async_channel::bounded::<TransferResponse>(256);
-    let (script_tx, script_rx) = async_channel::bounded::<TransferResponse>(256);
-
-    let mut output_folder = config.folder.join("warcs");
-    tokio::fs::create_dir_all(&output_folder).await?;
-    output_folder = tokio::fs::canonicalize(output_folder).await?;
 
     let out = Arc::new(Mutex::new(WARCFileOutput::new(
         output_folder,
@@ -61,24 +73,46 @@ async fn main() -> anyhow::Result<()> {
     let mut writer_tasks = Vec::with_capacity(config.output.workers);
     let mut script_tasks = JoinSet::new();
 
+    log::info!(
+        "Starting {} http workers ({} tasks each)",
+        config.http.workers,
+        config.http.tasks_per_worker
+    );
+
     for _ in 0..config.http.workers {
         let hyper_client = Client::builder().build::<_, hyper::Body>(HttpsConnector::new());
         let url_rx = url_rx.clone();
+        let http_job_rx = http_job_rx.clone();
+        let response_tx = response_tx.clone();
 
         let mut client = HttpClient::new(
             seen_url_db.clone(),
             hyper_client,
             url_tx.clone(),
-            response_tx.clone(),
-            HeaderMap::new(),
+            config.http.headers.clone(),
             Arc::clone(&http_semaphore),
             config.http.tasks_per_worker,
             config.http.request_timeout,
         );
 
         http_tasks.spawn(async move {
-            while let Some(url) = url_rx.recv().await.ok() {
-                client.add_task(url).await.unwrap();
+            #[allow(unused_must_use)]
+            loop {
+                tokio::select! {
+                    Ok(job) = http_job_rx.recv() => {
+                        let response_tx = response_tx.clone();
+                        client.add_task(job.url, |resp| async move {
+                            job.sender.send(resp.clone());
+                            response_tx.send(resp).await;
+                            Ok(())
+                        }).await?
+                    },
+                    Ok(url) = url_rx.recv() => {
+                        let response_tx = response_tx.clone();
+                        client.add_task(url, |resp| async move { response_tx.send(resp).await; Ok(()) }).await?;
+                    },
+                    else => break,
+                }
             }
 
             ForkliftResult::Ok(())
@@ -87,17 +121,17 @@ async fn main() -> anyhow::Result<()> {
 
     let http_task_count = config.http.workers * config.http.tasks_per_worker;
 
-    let _splitter_task = {
+    {
         let script_tx = script_tx.clone();
         let _response_tx = response_tx.clone();
         tokio::task::spawn(async move {
             #[allow(unused_must_use)]
-            while let Some(lhs) = response_rx.recv().await.ok() {
+            while let Ok(lhs) = response_rx.recv().await {
                 let rhs = lhs.clone();
                 let script_tx = script_tx.clone();
                 let record_tx = record_tx.clone();
 
-                if config.http.tasks_per_worker != 0 {
+                if config.script_manager.workers != 0 {
                     tokio::task::spawn(async move {
                         script_tx.send(rhs).await;
                     });
@@ -112,12 +146,14 @@ async fn main() -> anyhow::Result<()> {
         });
     };
 
+    log::info!("Starting {} output workers", config.output.workers);
+
     for _ in 0..config.output.workers {
         let mut writer = RecordProcessor::new(6, db.clone(), Arc::clone(&out))?;
         let record_rx = record_rx.clone();
 
         writer_tasks.push(tokio::task::spawn_blocking(move || {
-            while let Some(response) = record_rx.recv_blocking().ok() {
+            while let Ok(response) = record_rx.recv_blocking() {
                 writer.add_record(WarcRecord::from_response(
                     &response.parts,
                     response.body,
@@ -128,26 +164,48 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
+    log::info!("Starting {} script workers", config.script_manager.workers);
+    log::info!(
+        "Selected scripts: {}",
+        config
+            .scripts
+            .keys()
+            .map(|v| v.as_str())
+            .collect::<Vec<&str>>()
+            .join(",")
+    );
+
     for _ in 0..config.script_manager.workers {
         let script_rx = script_rx.clone();
         let mut script_manager = ScriptManager::new(
             1,
             url_tx.clone(),
+            http_job_tx.clone(),
             seen_url_db.clone(),
             config.crawl.base_url.clone(),
         );
         let script_semaphore = Arc::clone(&script_semaphore);
 
-        for (k, script) in config.scripts.iter() {
-            println!("starting script {k}");
-            script_manager.script(&script)?;
+        for (_, script) in config.scripts.iter() {
+            script_manager.script(script)?;
         }
 
+        let mut script_close_rx = script_close_rx.clone();
+
         script_tasks.spawn(async move {
-            while let Some(response) = script_rx.recv().await.ok() {
-                let permit = script_semaphore.acquire().await.unwrap();
-                script_manager.run(&response).await?;
-                drop(permit);
+            loop {
+                tokio::select! {
+                    Ok(response) = script_rx.recv() => {
+                        let permit = script_semaphore.acquire().await.unwrap();
+                        script_manager.run(&response).await?;
+                        drop(permit);
+                    }
+                    _ = script_close_rx.changed() => {
+                        script_manager.close().await?;
+                        break;
+                    },
+                    else => break
+                }
             }
 
             ForkliftResult::Ok(())
@@ -180,7 +238,6 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         checker_interval.tick().await;
-        // dbg!(script_semaphore.available_permits());
 
         if http_semaphore.available_permits() == http_task_count
             && script_semaphore.available_permits() == config.script_manager.workers
@@ -188,14 +245,16 @@ async fn main() -> anyhow::Result<()> {
             && response_tx.is_empty()
             && record_rx.is_empty()
             && script_tx.is_empty()
+            && http_job_rx.is_empty()
         {
             break;
         }
     }
 
     url_tx.close();
+    http_job_tx.close();
 
-    while let Some(_) = http_tasks.join_next().await.transpose()? {}
+    while http_tasks.join_next().await.transpose()?.is_some() {}
 
     response_tx.close();
     record_rx.close();
@@ -206,9 +265,16 @@ async fn main() -> anyhow::Result<()> {
 
     script_tx.close();
 
-    script_tasks.shutdown().await;
+    #[allow(unused_must_use)]
+    {
+        script_close_tx.send(true);
+    };
 
-    println!("{:?}", start.elapsed());
+    drop(script_close_tx);
+
+    while script_tasks.join_next().await.is_some() {}
+
+    log::info!("Crawl done in {:?}", start.elapsed());
 
     Ok(())
 }

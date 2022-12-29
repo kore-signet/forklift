@@ -1,10 +1,15 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 
-use serde::{Deserialize, Deserializer};
+use hyper::{header::HeaderName, http::HeaderValue, HeaderMap};
+use serde::{
+    ser::{SerializeMap, SerializeSeq},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use url::Url;
 
 use crate::scripting::ScriptConfig;
@@ -68,7 +73,75 @@ where
     Ok(bytes.as_u64())
 }
 
-#[derive(Deserialize)]
+fn deserialize_headers<'de, D>(deserializer: D) -> Result<HeaderMap, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let deser_map = BTreeMap::<&str, OneOrMany>::deserialize(deserializer)?;
+    let mut headers = HeaderMap::with_capacity(deser_map.len());
+
+    deser_map
+        .into_iter()
+        .filter_map(|(key, vals)| HeaderName::from_str(key).ok().zip(Some(vals)))
+        .filter_map(|(key, vals)| {
+            let vals = match vals {
+                OneOrMany::One(ref s) => HeaderValue::from_str(s).ok().map(|v| vec![v]),
+                OneOrMany::Many(vals) => vals
+                    .into_iter()
+                    .map(|v| HeaderValue::from_str(&v).ok())
+                    .collect::<Option<Vec<HeaderValue>>>(),
+            }?;
+
+            Some((key, vals))
+        })
+        .for_each(|(k, v)| {
+            for val in v {
+                headers.append(&k, val);
+            }
+        });
+
+    Ok(headers)
+}
+
+#[repr(transparent)]
+struct HeaderSeqSerializer<'a>(hyper::header::GetAll<'a, HeaderValue>);
+
+impl<'a> Serialize for HeaderSeqSerializer<'a> {
+    fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let iter = self.0.iter();
+        let mut seq = ser.serialize_seq(iter.size_hint().1)?;
+        for val in iter.filter_map(|v| v.to_str().ok()) {
+            seq.serialize_element(val)?;
+        }
+
+        seq.end()
+    }
+}
+
+fn serialize_headers<S>(map: &HeaderMap, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = ser.serialize_map(Some(map.len()))?;
+    for key in map.keys() {
+        seq.serialize_key(key.as_str())?;
+        seq.serialize_value(&HeaderSeqSerializer(map.get_all(key)))?;
+    }
+
+    seq.end()
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct ForkliftConfig {
     #[serde(default = "base::folder")]
     pub folder: PathBuf,
@@ -86,7 +159,7 @@ pub struct ForkliftConfig {
     pub index: IndexConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ScriptManagerConfig {
     #[serde(default = "script_manager::workers")]
     pub workers: usize,
@@ -100,7 +173,7 @@ impl Default for ScriptManagerConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct HTTPConfig {
     #[serde(default = "http::workers")]
     pub workers: usize,
@@ -108,6 +181,12 @@ pub struct HTTPConfig {
     pub tasks_per_worker: usize,
     #[serde(default = "http::request_timeout", with = "humantime_serde")]
     pub request_timeout: Duration,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_headers",
+        serialize_with = "serialize_headers"
+    )]
+    pub headers: HeaderMap,
 }
 
 impl Default for HTTPConfig {
@@ -116,11 +195,12 @@ impl Default for HTTPConfig {
             workers: http::workers(),
             tasks_per_worker: http::tasks_per_worker(),
             request_timeout: http::request_timeout(),
+            headers: HeaderMap::new(),
         }
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct OutputConfig {
     #[serde(default = "output::workers")]
     pub workers: usize,
@@ -143,7 +223,7 @@ impl Default for OutputConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CrawlConfig {
     #[serde(default)]
     pub urls_file: Option<String>,
@@ -160,7 +240,7 @@ impl Default for CrawlConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct IndexConfig {
     #[serde(default = "index::compression")]
     pub compression: bool,

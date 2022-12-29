@@ -8,6 +8,8 @@ use url::Url;
 pub mod client;
 pub mod config;
 pub mod scripting;
+mod surt;
+pub use surt::*;
 pub mod warc;
 pub mod writer;
 
@@ -23,6 +25,12 @@ pub enum ForkliftError {
     SledError(#[from] sled::Error),
     #[error(transparent)]
     JoinError(#[from] JoinError),
+    #[error("invalid op code received from script")]
+    InvalidOpcode,
+    #[error("invalid string")]
+    InvalidString,
+    #[error(transparent)]
+    SerdeJsonError(#[from] serde_json::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error), // source and Display delegate to anyhow::Error
 }
@@ -96,4 +104,9 @@ impl UrlSource {
             source_url: Some(prev.current_url.clone()),
         }
     }
+}
+
+pub struct HttpJob {
+    pub url: UrlSource,
+    pub sender: tokio::sync::oneshot::Sender<TransferResponse>,
 }

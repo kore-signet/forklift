@@ -1,26 +1,27 @@
 import sys
 import struct
-from base import run_scraper
+from base import run
 from bs4 import BeautifulSoup
 import re
 
 css_expression = re.compile(r"""url\((?!['"]?(?:data):)['"]?([^'"\)]*)['"]?\)""")
 
-def scrape(inp, out):
+async def scrape(rpc, url, inp):
     soup = BeautifulSoup(inp, 'lxml')
+
     for lnk in soup.find_all("a"):
         if href := lnk.get('href', None):
-            out.write(href.encode("utf8"))
-            out.write(b"\n")
+            rpc.submit_url(href)
     
     for lnk in soup.find_all("link"):
         if href := lnk.get('href', None):
-            out.write(href.encode("utf8"))
-            out.write(b"\n")
+            rpc.submit_url(href)
 
     for style in soup.find_all("style"):
         for link in css_expression.finditer(style.string):
-            out.write(link.group(1).encode("utf8"))
-            out.write(b"\n")
+            rpc.submit_url(link.group(1))
 
-run_scraper(scrape)
+    
+    res = await rpc.get_url("https://cat-girl.gay")
+
+run(scrape)

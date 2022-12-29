@@ -1,0 +1,29 @@
+folder = "picrew"
+
+[crawl]
+base_url = "https://picrew.me/image_maker/1689727"
+
+[http]
+workers = 4
+tasks_per_worker = 16
+
+[http.headers]
+"User-Agent" = "Mozilla/5.0 (X11; Linux x86_64; rv:92.0) Gecko/20100101 Firefox/92.0"
+
+[output]
+workers = 2
+file_prefix = "catgirl-gay-"
+file_size = "1GB"
+
+[index]
+compression = true
+compression_level = 5
+overwrite = true
+
+[script_manager]
+workers = 2
+
+[scripts.html]
+filter = { mime_types = ["text/html"] }
+command = "python"
+args = ["scripts/picrew.py"] 

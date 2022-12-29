@@ -9,14 +9,17 @@ edition = "2021"
 addr = "0.15.6"
 anyhow = { version = "1.0.68", features = ["backtrace"] }
 async-channel = "1.8.0"
+async-trait = "0.1.60"
 base16 = "0.2.1"
-bytes = "1.3.0"
+bytes = { version = "1.3.0", features = ["serde"] }
 bytesize-serde = "0.2.1"
 crc32fast = "1.3.2"
 futures = "0.3.25"
 humantime-serde = "1.1.1"
 hyper = { version = "0.14.23", features = ["full"] }
 hyper-tls = "0.5.0"
+itoa = "1.0.5"
+lazy-regex = "2.3.1"
 log = "0.4.17"
 miniz_oxide = { version = "0.6.2", features = ["simd"] }
 neo-mime = { version = "0.1.1", features = ["serde"] }
@@ -24,14 +27,16 @@ pretty_env_logger = "0.4.0"
 regex = "1.7.0"
 rkyv = "0.7.39"
 serde = { version = "1.0.152", features = ["derive"] }
+serde_json = { version = "1.0.91", features = ["raw_value"] }
 serde_regex = "1.1.0"
 sha2 = "0.10.6"
 sled = { version = "0.34.7", features = ["compression"] }
 thiserror = "1.0.38"
-time = { version = "0.3.17", default-features = false, features = ["formatting", "std"] }
+time = { version = "0.3.17", default-features = false, features = ["formatting", "std", "macros"] }
 tokio = { version = "1.23.0", features = ["full"] }
 tokio-stream = { version = "0.1.11", default-features = false, features = ["io-util"] }
 toml = "0.5.10"
 url = { version = "2.3.1", features = ["serde"] }
 uuid = { version = "1.2.2", default-features = false, features = ["v4", "fast-rng"] }
+zerocopy = "0.6.1"
 zstd = "^0.9.0"
