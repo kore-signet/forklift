@@ -43,7 +43,7 @@ impl HttpClient {
         R: Future<Output = ForkliftResult<()>> + Send,
         F: FnOnce(TransferResponse) -> R + Send + 'static,
     {
-        if self.tasks.len() == self.task_max - 1 {
+        if self.tasks.len() == self.task_max {
             self.tasks.join_next().await;
         }
 

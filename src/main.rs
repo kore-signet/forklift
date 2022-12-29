@@ -1,23 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use forklift::{
-    client::HttpClient,
     config::ForkliftConfig,
-    scripting::ScriptManager,
-    warc::WarcRecord,
-    writer::{RecordProcessor, WARCFileOutput},
-    ForkliftError, ForkliftResult, HttpJob, TransferResponse, UrlSource,
+    runner::{ChannelManager, HttpRunner, ScriptRunner, WriterRunner},
+    writer::WARCFileOutput,
+    ForkliftResult, UrlSource,
 };
-use futures::TryFutureExt;
-use hyper::Client;
-use hyper_tls::HttpsConnector;
 
 use std::time::Duration;
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    sync::Semaphore,
-    task::JoinSet,
-};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use url::Url;
 
 #[tokio::main]
@@ -32,12 +23,7 @@ async fn inner_main() -> anyhow::Result<()> {
         toml::from_str(&std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap())
             .unwrap();
 
-    let (url_tx, url_rx) = async_channel::bounded::<UrlSource>(1024 * 8);
-    let (http_job_tx, http_job_rx) = async_channel::bounded::<HttpJob>(1024 * 8);
-    let (response_tx, response_rx) = async_channel::bounded::<TransferResponse>(256);
-    let (record_tx, record_rx) = async_channel::bounded::<TransferResponse>(256);
-    let (script_tx, script_rx) = async_channel::bounded::<TransferResponse>(256);
-    let (script_close_tx, script_close_rx) = tokio::sync::watch::channel(false);
+    let channels = ChannelManager::new(&config);
 
     let mut output_folder = config.folder.join("warcs");
     tokio::fs::create_dir_all(&output_folder).await?;
@@ -60,70 +46,21 @@ async fn inner_main() -> anyhow::Result<()> {
         seen_url_db.clear()?;
     }
 
-    let out = Arc::new(Mutex::new(WARCFileOutput::new(
+    let output = Arc::new(Mutex::new(WARCFileOutput::new(
         output_folder,
-        config.output.file_prefix,
+        &config.output.file_prefix,
         config.output.file_size,
     )?));
 
-    let http_semaphore = Arc::new(Semaphore::new(0));
-    let script_semaphore = Arc::new(Semaphore::new(config.script_manager.workers));
-
-    let mut http_tasks = JoinSet::new();
-    let mut writer_tasks = Vec::with_capacity(config.output.workers);
-    let mut script_tasks = JoinSet::new();
-
-    log::info!(
-        "Starting {} http workers ({} tasks each)",
-        config.http.workers,
-        config.http.tasks_per_worker
-    );
-
-    for _ in 0..config.http.workers {
-        let hyper_client = Client::builder().build::<_, hyper::Body>(HttpsConnector::new());
-        let url_rx = url_rx.clone();
-        let http_job_rx = http_job_rx.clone();
-        let response_tx = response_tx.clone();
-
-        let mut client = HttpClient::new(
-            seen_url_db.clone(),
-            hyper_client,
-            url_tx.clone(),
-            config.http.headers.clone(),
-            Arc::clone(&http_semaphore),
-            config.http.tasks_per_worker,
-            config.http.request_timeout,
-        );
-
-        http_tasks.spawn(async move {
-            #[allow(unused_must_use)]
-            loop {
-                tokio::select! {
-                    Ok(job) = http_job_rx.recv() => {
-                        let response_tx = response_tx.clone();
-                        client.add_task(job.url, |resp| async move {
-                            job.sender.send(resp.clone());
-                            response_tx.send(resp).await;
-                            Ok(())
-                        }).await?
-                    },
-                    Ok(url) = url_rx.recv() => {
-                        let response_tx = response_tx.clone();
-                        client.add_task(url, |resp| async move { response_tx.send(resp).await; Ok(()) }).await?;
-                    },
-                    else => break,
-                }
-            }
-
-            ForkliftResult::Ok(())
-        });
-    }
-
-    let http_task_count = config.http.workers * config.http.tasks_per_worker;
+    let mut http_runner = HttpRunner::spawn(&config.http, &channels, &seen_url_db);
+    let mut writer_runner = WriterRunner::spawn(&config.output, &channels, &db, output)?;
+    let mut script_runner = ScriptRunner::spawn(&config, &channels, &seen_url_db)?;
 
     {
-        let script_tx = script_tx.clone();
-        let _response_tx = response_tx.clone();
+        let script_tx = channels.script.tx.clone();
+        let response_rx = channels.response.rx.clone();
+        let record_tx = channels.record.tx.clone();
+
         tokio::task::spawn(async move {
             #[allow(unused_must_use)]
             while let Ok(lhs) = response_rx.recv().await {
@@ -146,88 +83,21 @@ async fn inner_main() -> anyhow::Result<()> {
         });
     };
 
-    log::info!("Starting {} output workers", config.output.workers);
-
-    for _ in 0..config.output.workers {
-        let mut writer = RecordProcessor::new(6, db.clone(), Arc::clone(&out))?;
-        let record_rx = record_rx.clone();
-
-        writer_tasks.push(tokio::task::spawn_blocking(move || {
-            while let Ok(response) = record_rx.recv_blocking() {
-                writer.add_record(WarcRecord::from_response(
-                    &response.parts,
-                    response.body,
-                    response.target_url.current_url.as_str(),
-                )?)?;
-            }
-            ForkliftResult::Ok(())
-        }));
-    }
-
-    log::info!("Starting {} script workers", config.script_manager.workers);
-    log::info!(
-        "Selected scripts: {}",
-        config
-            .scripts
-            .keys()
-            .map(|v| v.as_str())
-            .collect::<Vec<&str>>()
-            .join(",")
-    );
-
-    for _ in 0..config.script_manager.workers {
-        let script_rx = script_rx.clone();
-        let mut script_manager = ScriptManager::new(
-            1,
-            url_tx.clone(),
-            http_job_tx.clone(),
-            seen_url_db.clone(),
-            config.crawl.base_url.clone(),
-        );
-        let script_semaphore = Arc::clone(&script_semaphore);
-
-        for (_, script) in config.scripts.iter() {
-            script_manager.script(script)?;
-        }
-
-        let mut script_close_rx = script_close_rx.clone();
-
-        script_tasks.spawn(async move {
-            loop {
-                tokio::select! {
-                    Ok(response) = script_rx.recv() => {
-                        let permit = script_semaphore.acquire().await.unwrap();
-                        script_manager.run(&response).await?;
-                        drop(permit);
-                    }
-                    _ = script_close_rx.changed() => {
-                        script_manager.close().await?;
-                        break;
-                    },
-                    else => break
-                }
-            }
-
-            ForkliftResult::Ok(())
-        });
-    }
-
-    drop(script_rx);
-
     let start = std::time::Instant::now();
 
     if let Some(url_file) = config.crawl.urls_file {
         let mut lines = BufReader::new(tokio::fs::File::open(&url_file).await?).lines();
-        let url_tx = url_tx.clone();
         while let Some(line) = lines
             .next_line()
             .await?
             .and_then(|url| url.trim_end().parse::<Url>().ok())
         {
-            url_tx.send(UrlSource::start(line)).await.unwrap();
+            channels.url.tx.send(UrlSource::start(line)).await.unwrap();
         }
     } else {
-        url_tx
+        channels
+            .url
+            .tx
             .send(UrlSource::start(config.crawl.base_url))
             .await
             .unwrap();
@@ -239,40 +109,31 @@ async fn inner_main() -> anyhow::Result<()> {
     loop {
         checker_interval.tick().await;
 
-        if http_semaphore.available_permits() == http_task_count
-            && script_semaphore.available_permits() == config.script_manager.workers
-            && url_rx.is_empty()
-            && response_tx.is_empty()
-            && record_rx.is_empty()
-            && script_tx.is_empty()
-            && http_job_rx.is_empty()
-        {
+        if channels.is_empty() && http_runner.is_idle() && script_runner.is_idle() {
             break;
         }
     }
 
-    url_tx.close();
-    http_job_tx.close();
+    channels.url.tx.close();
+    channels.http_job.tx.close();
 
-    while http_tasks.join_next().await.transpose()?.is_some() {}
+    http_runner.join_all().await?;
 
-    response_tx.close();
-    record_rx.close();
+    channels.response.tx.close();
+    channels.record.rx.close();
 
-    futures::future::try_join_all(writer_tasks)
-        .map_err(ForkliftError::JoinError)
-        .await?;
+    writer_runner.join_all().await?;
 
-    script_tx.close();
+    channels.script.tx.close();
 
     #[allow(unused_must_use)]
     {
-        script_close_tx.send(true);
+        channels.script_close.tx.send(true);
     };
 
-    drop(script_close_tx);
+    drop(channels);
 
-    while script_tasks.join_next().await.is_some() {}
+    script_runner.join_all().await?;
 
     log::info!("Crawl done in {:?}", start.elapsed());
 

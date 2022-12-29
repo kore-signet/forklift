@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     path::{Path, PathBuf},
     str::FromStr,
@@ -84,12 +85,12 @@ where
         Many(Vec<String>),
     }
 
-    let deser_map = BTreeMap::<&str, OneOrMany>::deserialize(deserializer)?;
+    let deser_map = BTreeMap::<Cow<'_, str>, OneOrMany>::deserialize(deserializer)?;
     let mut headers = HeaderMap::with_capacity(deser_map.len());
 
     deser_map
         .into_iter()
-        .filter_map(|(key, vals)| HeaderName::from_str(key).ok().zip(Some(vals)))
+        .filter_map(|(key, vals)| HeaderName::from_str(&key).ok().zip(Some(vals)))
         .filter_map(|(key, vals)| {
             let vals = match vals {
                 OneOrMany::One(ref s) => HeaderValue::from_str(s).ok().map(|v| vec![v]),

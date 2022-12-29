@@ -6,8 +6,8 @@ use rkyv::Deserialize;
 fn main() -> anyhow::Result<()> {
     let path = PathBuf::from(std::env::args().nth(1).unwrap());
 
-    let config: ForkliftConfig =
-        serde_json::from_reader(File::open(path.with_file_name("config.json"))?)?;
+    let config: ForkliftConfig = serde_json::from_reader(File::open(path.join("config.json"))?)?;
+
     let db = config.index.into_db(path.join("idx"))?;
 
     let mut iter = db.iter();
