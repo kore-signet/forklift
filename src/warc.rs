@@ -4,7 +4,7 @@ use hyper::{
     client::connect::HttpInfo,
     header::{CONTENT_TYPE, LOCATION},
     http::{response::Parts as ResponseParts, HeaderValue},
-    HeaderMap,
+    HeaderMap, Version,
 };
 use rkyv::{Archive, Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -62,7 +62,7 @@ impl WarcRecord {
 
         let mut warc_headers = HeaderMap::new();
         warc_headers.insert(
-            "Warc-Target-URI",
+            "WARC-Target-URI",
             HeaderValue::from_str(target_url).unwrap(),
         );
         cdx.url = target_url.to_string();
@@ -102,10 +102,19 @@ impl WarcRecord {
 
         res.extensions.get::<HttpInfo>().map(|info| {
             warc_headers.insert(
-                "Warc-IP-Address",
+                "WARC-IP-Address",
                 HeaderValue::try_from(info.remote_addr().to_string()).unwrap(),
             );
         });
+
+        warc_headers.insert("WARC-Protocol", HeaderValue::from_static(match res.version {
+            Version::HTTP_09 => "http/0.9",
+            Version::HTTP_10 => "http/1.0",
+            Version::HTTP_11 => "http/1.1",
+            Version::HTTP_2 => "h2",
+            Version::HTTP_3 => "h3",
+            _ => unreachable!()
+        }));
 
         let mut block = BytesMut::with_capacity(body.len() + 1024);
 

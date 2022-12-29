@@ -1,8 +1,7 @@
-folder = "catgirl-crawl"
+folder = "example-crawl"
 
 [crawl]
-base_url = "https://cat-girl.gay"
-urls_file = "cat-girl.txt"
+base_url = "https://example.com"
 
 [http]
 workers = 4
@@ -13,7 +12,7 @@ tasks_per_worker = 16
 
 [output]
 workers = 2
-file_prefix = "catgirl-gay-"
+file_prefix = "example-"
 file_size = "1GB"
 
 [index]

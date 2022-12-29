@@ -1,7 +1,7 @@
 folder = "picrew"
 
 [crawl]
-base_url = "https://picrew.me/image_maker/1689727"
+base_url = "https://picrew.me/image_maker/ddddddd"
 
 [http]
 workers = 4
@@ -12,7 +12,7 @@ tasks_per_worker = 16
 
 [output]
 workers = 2
-file_prefix = "catgirl-gay-"
+file_prefix = "picrew-"
 file_size = "1GB"
 
 [index]
