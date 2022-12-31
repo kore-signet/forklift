@@ -107,14 +107,17 @@ impl WarcRecord {
             );
         });
 
-        warc_headers.insert("WARC-Protocol", HeaderValue::from_static(match res.version {
-            Version::HTTP_09 => "http/0.9",
-            Version::HTTP_10 => "http/1.0",
-            Version::HTTP_11 => "http/1.1",
-            Version::HTTP_2 => "h2",
-            Version::HTTP_3 => "h3",
-            _ => unreachable!()
-        }));
+        warc_headers.insert(
+            "WARC-Protocol",
+            HeaderValue::from_static(match res.version {
+                Version::HTTP_09 => "http/0.9",
+                Version::HTTP_10 => "http/1.0",
+                Version::HTTP_11 => "http/1.1",
+                Version::HTTP_2 => "h2",
+                Version::HTTP_3 => "h3",
+                _ => unreachable!(),
+            }),
+        );
 
         let mut block = BytesMut::with_capacity(body.len() + 1024);
 

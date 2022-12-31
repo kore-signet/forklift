@@ -1,7 +1,7 @@
 folder = "picrew"
 
 [crawl]
-base_url = "https://picrew.me/image_maker/ddddddd"
+base_url = "https://picrew.me/image_maker/dddddddd"
 
 [http]
 workers = 4

@@ -6,22 +6,28 @@ import re
 
 css_expression = re.compile(r"""url\((?!['"]?(?:data):)['"]?([^'"\)]*)['"]?\)""")
 
+class SimpleScraper:
+    def __init__(self, rpc, inp):
+        self.rpc = rpc
+        self.soup = BeautifulSoup(inp, 'lxml')
+    
+    def extract_from_attr(self, tag, attr):
+        for t in self.soup.find_all(tag):
+            if lnk := t.get(attr, None):
+                self.rpc.submit_url(lnk)
+    
+    def extract_with_generator(self, tag, gen):
+        for t in self.soup.find_all(tag):
+            for lnk in filter(lambda r: r is not None, gen(t)):
+                self.rpc.submit_url(lnk)
+
 async def scrape(rpc, url, inp):
-    soup = BeautifulSoup(inp, 'lxml')
+    scraper = SimpleScraper(rpc, inp)
 
-    for lnk in soup.find_all("a"):
-        if href := lnk.get('href', None):
-            rpc.submit_url(href)
-    
-    for lnk in soup.find_all("link"):
-        if href := lnk.get('href', None):
-            rpc.submit_url(href)
-
-    for style in soup.find_all("style"):
-        for link in css_expression.finditer(style.string):
-            rpc.submit_url(link.group(1))
-
-    
-    res = await rpc.get_url("https://cat-girl.gay")
+    scraper.extract_from_attr("a", "href")
+    scraper.extract_from_attr("link", "href")
+    scraper.extract_from_attr("img", "src")
+    scraper.extract_from_attr("script", "src")
+    scraper.extract_with_generator("style", lambda tag: (link.group(1) for link in css_expression.finditer(tag.string)))
 
 run(scrape)

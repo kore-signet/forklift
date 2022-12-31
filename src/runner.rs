@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_channel::Receiver as QueueReceiver;
@@ -195,6 +197,7 @@ impl WriterRunner {
 pub struct ScriptRunner {
     total_permits: usize,
     semaphore: Arc<Semaphore>,
+    rpc_counter: Arc<AtomicUsize>,
     tasks: JoinSet<ForkliftResult<()>>,
 }
 
@@ -216,6 +219,7 @@ impl ScriptRunner {
         );
 
         let semaphore = Arc::new(Semaphore::new(config.script_manager.workers));
+        let rpc_counter = Arc::new(AtomicUsize::new(0));
         let mut tasks = JoinSet::new();
 
         for _ in 0..config.script_manager.workers {
@@ -230,6 +234,7 @@ impl ScriptRunner {
                 channels.http_job.tx.clone(),
                 db.clone(),
                 config.crawl.base_url.clone(),
+                Arc::clone(&rpc_counter),
             );
 
             for (_, script) in config.scripts.iter() {
@@ -258,6 +263,7 @@ impl ScriptRunner {
 
         Ok(ScriptRunner {
             total_permits: config.script_manager.workers,
+            rpc_counter,
             semaphore,
             tasks,
         })
@@ -265,6 +271,7 @@ impl ScriptRunner {
 
     pub fn is_idle(&self) -> bool {
         self.semaphore.available_permits() == self.total_permits
+            && self.rpc_counter.load(Ordering::Acquire) == 0
     }
 
     pub async fn join_all(&mut self) -> ForkliftResult<()> {

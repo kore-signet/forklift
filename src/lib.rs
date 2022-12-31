@@ -11,6 +11,7 @@ pub mod scripting;
 mod surt;
 pub use surt::*;
 pub mod runner;
+pub mod utils;
 pub mod warc;
 pub mod writer;
 

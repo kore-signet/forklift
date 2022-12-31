@@ -4,7 +4,11 @@ use neo_mime::{MediaRange, MediaType};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicUsize, Arc},
+    time::Duration,
+};
 
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
@@ -13,7 +17,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::{ForkliftResult, HttpJob, TransferResponse, UrlSource};
+use crate::{utils::SimplePermit, ForkliftResult, HttpJob, TransferResponse, UrlSource};
 
 use super::protocol::{
     RpcMethod, RpcRequest, RpcResponse, ScriptInput, ScriptMessage, ScriptOutput,
@@ -29,6 +33,7 @@ pub struct Script {
     pub(crate) proc_out: Arc<Mutex<ScriptInput<BufReader<ChildStdout>>>>,
     pub(crate) url_tx: QueueSender<UrlSource>,
     pub(crate) http_job_tx: QueueSender<HttpJob>,
+    pub(crate) rpc_requests: Arc<AtomicUsize>,
 }
 
 impl Script {
@@ -107,6 +112,7 @@ impl Script {
         proc_in: &mut ScriptOutput<BufWriter<ChildStdin>>,
         proc_in_handle: Arc<Mutex<ScriptOutput<BufWriter<ChildStdin>>>>,
     ) -> ForkliftResult<()> {
+        let permit = SimplePermit::new(&self.rpc_requests);
         let (response_tx, response_rx) = tokio::sync::oneshot::channel::<TransferResponse>();
 
         let url = match req
@@ -135,6 +141,7 @@ impl Script {
         // spawns a task that will wait for the request to be finished and send the response over
 
         tokio::task::spawn(async move {
+            let permit = permit; // move permit into task explicitly
             let val = tokio::time::timeout(Duration::from_secs(60 * 5), response_rx).await;
             let mut proc_in = proc_in_handle.lock().await;
             match val {
@@ -143,12 +150,14 @@ impl Script {
                         .send_rpc_response(RpcResponse::ok(req.id, v.body))
                         .await?;
                     proc_in.flush().await?;
+                    drop(permit);
                 }
                 _ => {
                     proc_in
                         .send_rpc_response(RpcResponse::error(req.id, -32603, String::new()))
                         .await?;
                     proc_in.flush().await?;
+                    drop(permit);
                 }
             };
 

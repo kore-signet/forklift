@@ -1,7 +1,10 @@
 use async_channel::Sender;
 use futures::{stream::TryStreamExt, StreamExt};
 
-use std::{process::Stdio, sync::Arc};
+use std::{
+    process::Stdio,
+    sync::{atomic::AtomicUsize, Arc},
+};
 use tokio::{
     io::{BufReader, BufWriter},
     process::Command,
@@ -23,6 +26,7 @@ pub struct ScriptManager {
     url_tx: Sender<UrlSource>,
     http_job_tx: Sender<HttpJob>,
     db: sled::Tree,
+    rpc_counter: Arc<AtomicUsize>,
 }
 
 impl ScriptManager {
@@ -32,6 +36,7 @@ impl ScriptManager {
         http_job_tx: Sender<HttpJob>,
         db: sled::Tree,
         base_url: Url,
+        rpc_counter: Arc<AtomicUsize>,
     ) -> ScriptManager {
         ScriptManager {
             scripts: Vec::new(),
@@ -40,6 +45,7 @@ impl ScriptManager {
             http_job_tx,
             db,
             base_url,
+            rpc_counter,
         }
     }
 
@@ -67,6 +73,7 @@ impl ScriptManager {
             filter: cfg.filter.clone(),
             proc_in: Arc::new(Mutex::new(ScriptOutput::new(proc_in))),
             proc_out: Arc::new(Mutex::new(ScriptInput::new(proc_out))),
+            rpc_requests: Arc::clone(&self.rpc_counter),
             proc,
         });
 
