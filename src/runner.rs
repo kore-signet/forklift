@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_channel::Receiver as QueueReceiver;
 use async_channel::Sender as QueueSender;
 use hyper::Client;
-use hyper_tls::HttpsConnector;
+use hyper_rustls::HttpsConnectorBuilder;
 use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
 use tokio::task::JoinHandle;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -96,7 +96,18 @@ impl HttpRunner {
         );
 
         for _ in 0..config.workers {
-            let hyper_client = Client::builder().build::<_, hyper::Body>(HttpsConnector::new());
+            let https_builder = HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .https_or_http()
+                .enable_http1();
+
+            let connector = if config.enable_http2 {
+                https_builder.enable_http2().build()
+            } else {
+                https_builder.build()
+            };
+
+            let hyper_client = Client::builder().build::<_, hyper::Body>(connector);
             let (url_rx, http_job_rx, response_tx, record_tx) = (
                 channels.url.rx.clone(),
                 channels.http_job.rx.clone(),

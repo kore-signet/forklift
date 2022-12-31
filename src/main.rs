@@ -1,5 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
+use clap::Parser;
 use forklift::{
     config::ForkliftConfig,
     runner::{ChannelManager, HttpRunner, ScriptRunner, WriterRunner},
@@ -11,17 +15,40 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use url::Url;
 
+#[derive(clap::Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    config: String,
+    #[arg(short, long)]
+    base_url: Option<String>,
+    #[arg(short, long)]
+    output_folder: String,
+    #[arg(short, long)]
+    file_prefix: Option<String>,
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    inner_main().await
+async fn main() {
+    inner_main().await.unwrap()
 }
 
 async fn inner_main() -> anyhow::Result<()> {
     pretty_env_logger::init();
+    let args = Args::parse();
 
     let mut config: ForkliftConfig =
-        toml::from_str(&std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap())
-            .unwrap();
+        toml::from_str(&tokio::fs::read_to_string(args.config).await?).unwrap();
+
+    if let Some(base_url) = args.base_url {
+        config.crawl.base_url = Url::parse(&base_url).unwrap();
+    }
+
+    if let Some(file_prefix) = args.file_prefix {
+        config.output.file_prefix = file_prefix;
+    }
+
+    config.folder = PathBuf::from(args.output_folder);
 
     let channels = ChannelManager::new(&config);
 

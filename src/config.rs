@@ -41,12 +41,13 @@ macro_rules! default_vals {
 
 default_vals! {
     base {
-        folder: std::path::PathBuf = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap().join("crawl/idx");
+        folder: std::path::PathBuf = std::path::PathBuf::new();
     };
     http {
         workers: usize = 4;
         tasks_per_worker: usize = 16;
         request_timeout: std::time::Duration = std::time::Duration::from_secs(60 * 20);
+        enable_http2: bool = true;
     };
     output {
         workers: usize = 4;
@@ -188,6 +189,8 @@ pub struct HTTPConfig {
         serialize_with = "serialize_headers"
     )]
     pub headers: HeaderMap,
+    #[serde(default = "http::enable_http2")]
+    pub enable_http2: bool,
 }
 
 impl Default for HTTPConfig {
@@ -197,6 +200,7 @@ impl Default for HTTPConfig {
             tasks_per_worker: http::tasks_per_worker(),
             request_timeout: http::request_timeout(),
             headers: HeaderMap::new(),
+            enable_http2: http::enable_http2(),
         }
     }
 }

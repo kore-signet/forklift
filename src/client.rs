@@ -3,7 +3,7 @@ use async_channel::Sender;
 
 use futures::Future;
 use hyper::{client::HttpConnector, header::LOCATION, Body, Client, HeaderMap, Request};
-use hyper_tls::HttpsConnector;
+use hyper_rustls::HttpsConnector;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, task::JoinSet};
 use url::Url;
