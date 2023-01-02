@@ -9,6 +9,7 @@ use std::{
     sync::{atomic::AtomicUsize, Arc},
     time::Duration,
 };
+use unicode_truncate::UnicodeTruncateStr;
 
 use prodash::tree::Item as DashboardItem;
 use tokio::{
@@ -53,9 +54,15 @@ impl Script {
             return Ok(());
         }
 
-        let mut logger = self
-            .dashboard
-            .add_child(record.target_url.current_url.as_str());
+        let mut logger = self.dashboard.add_child(
+            format!(
+                "{}{}",
+                record.target_url.current_url.host_str().unwrap_or(""),
+                record.target_url.current_url.path()
+            )
+            .unicode_truncate(60)
+            .0,
+        );
         logger.init(
             None,
             Some(prodash::unit::dynamic(prodash::unit::Human::new(
@@ -225,13 +232,4 @@ impl ScriptFilter {
 
         check
     }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ScriptConfig {
-    #[serde(default)]
-    pub(crate) filter: ScriptFilter,
-    pub(crate) command: String,
-    #[serde(default)]
-    pub(crate) args: Vec<String>,
 }

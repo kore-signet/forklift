@@ -15,7 +15,7 @@ use serde::{
 };
 use url::Url;
 
-use crate::scripting::ScriptConfig;
+use crate::scripting::ScriptFilter;
 
 macro_rules! default_vals {
     ($($mod_name:ident {
@@ -53,16 +53,17 @@ default_vals! {
         dns_cache_size: usize = 1024;
         rate_limiter_jitter: std::time::Duration = std::time::Duration::from_secs(1);
     };
+    scripts {
+        workers: usize = 4;
+    };
     output {
         workers: usize = 4;
         prefix: String = "forklift_crawl".to_owned();
         file_size: u64 = 2000000000; // 2GB
     };
-    script_manager {
-        workers: usize = 2;
-    };
     crawl {
         base_url: url::Url = url::Url::parse("http://forklift.local").unwrap();
+        max_hops: usize = 1;
     };
     index {
         compression: bool = true;
@@ -156,8 +157,6 @@ pub struct ForkliftConfig {
     #[serde(default)]
     pub http: HTTPConfig,
     #[serde(default)]
-    pub script_manager: ScriptManagerConfig,
-    #[serde(default)]
     pub output: OutputConfig,
     #[serde(default)]
     pub crawl: CrawlConfig,
@@ -166,17 +165,14 @@ pub struct ForkliftConfig {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ScriptManagerConfig {
-    #[serde(default = "script_manager::workers")]
-    pub workers: usize,
-}
-
-impl Default for ScriptManagerConfig {
-    fn default() -> Self {
-        Self {
-            workers: script_manager::workers(),
-        }
-    }
+pub struct ScriptConfig {
+    #[serde(default)]
+    pub(crate) filter: ScriptFilter,
+    pub(crate) command: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    #[serde(default = "scripts::workers")]
+    pub(crate) workers: usize,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -289,6 +285,8 @@ pub struct CrawlConfig {
     pub urls_file: Option<String>,
     #[serde(default = "crawl::base_url")]
     pub base_url: Url,
+    #[serde(default = "crawl::max_hops")]
+    pub max_hops: usize,
 }
 
 impl Default for CrawlConfig {
@@ -296,6 +294,7 @@ impl Default for CrawlConfig {
         Self {
             urls_file: Default::default(),
             base_url: crawl::base_url(),
+            max_hops: crawl::max_hops(),
         }
     }
 }

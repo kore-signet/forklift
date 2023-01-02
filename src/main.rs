@@ -6,7 +6,8 @@ use std::{
 use clap::Parser;
 use forklift::{
     config::ForkliftConfig,
-    runner::{ChannelManager, HttpRunner, ScriptRunner, WriterRunner},
+    runner::{ChannelManager, HttpRunner, WriterRunner},
+    scripting::ScriptRunner,
     writer::WARCFileOutput,
     ForkliftResult, HttpRateLimiter, UrlSource,
 };
@@ -51,8 +52,10 @@ async fn inner_main() -> anyhow::Result<()> {
             ..Default::default()
         },
     )?;
-    let (render_fut, render_abort) = futures::future::abortable(dashboard_render);
-    tokio::task::spawn(render_fut);
+    let (render_fut, _render_abort) = futures::future::abortable(dashboard_render);
+    tokio::task::spawn(async move {
+        render_fut.await.unwrap();
+    });
 
     let mut dashboard_total = dashboard_root.add_child("TOTAL");
     dashboard_total.init(
@@ -87,10 +90,6 @@ async fn inner_main() -> anyhow::Result<()> {
         serde_json::to_vec(&config)?,
     )
     .await?;
-
-    if config.scripts.is_empty() {
-        config.script_manager.workers = 0;
-    }
 
     let db: sled::Db = config.index.into_db(config.folder.join("idx"))?;
     let seen_url_db = db.open_tree("seen_urls")?;
@@ -129,24 +128,27 @@ async fn inner_main() -> anyhow::Result<()> {
         dashboard_root.add_child("SCRIPTING"),
     )?;
 
+    let has_scripts = !config.scripts.is_empty();
+
     {
         let script_tx = channels.script.tx.clone();
         let response_rx = channels.response.rx.clone();
         let record_tx = channels.record.tx.clone();
+        let mut queue_dash = dashboard_root.add_child("RECORD QUEUE");
 
         tokio::task::spawn(async move {
             #[allow(unused_must_use)]
             while let Ok(lhs) = response_rx.recv().await {
                 dashboard_total.inc();
-                
+
                 let rhs = lhs.clone();
                 let script_tx = script_tx.clone();
                 let record_tx = record_tx.clone();
 
-                if config.script_manager.workers != 0 {
-                    tokio::task::spawn(async move {
-                        script_tx.send(rhs).await;
-                    });
+                if has_scripts {
+                    queue_dash.blocked("sending to script queue", None);
+                    script_tx.send(rhs).await;
+                    queue_dash.running();
                 }
 
                 tokio::task::spawn(async move {
@@ -189,6 +191,8 @@ async fn inner_main() -> anyhow::Result<()> {
         }
     }
 
+    dbg!("closing.?");
+
     channels.url.tx.close();
     channels.http_job.tx.close();
 
@@ -210,7 +214,7 @@ async fn inner_main() -> anyhow::Result<()> {
 
     script_runner.join_all().await?;
 
-    render_abort.abort();
+    // render_abort.abort();
 
     println!("Crawl done in {:?}!", start.elapsed());
 

@@ -57,6 +57,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-broadcast"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b19760fa2b7301cf235360ffd6d3558b1ed4249edd16d6cca8d690cee265b95"
+dependencies = [
+ "event-listener",
+ "futures-core",
+ "parking_lot 0.12.1",
+]
+
+[[package]]
 name = "async-channel"
 version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -483,6 +494,7 @@ version = "0.1.0"
 dependencies = [
  "addr",
  "anyhow",
+ "async-broadcast",
  "async-channel",
  "base16",
  "bytes",
@@ -513,6 +525,7 @@ dependencies = [
  "tokio",
  "toml",
  "trust-dns-resolver",
+ "unicode-truncate",
  "url",
  "uuid",
  "zstd",
@@ -2074,6 +2087,15 @@ name = "unicode-segmentation"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fdbf052a0783de01e944a6ce7a8cb939e295b1e7be835a1112c3b9a7f047a5a"
+
+[[package]]
+name = "unicode-truncate"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a04be5ca5f7a4a7270ffea82bc41c59b87c611ed04f20e77c338e8d3c2348e42"
+dependencies = [
+ "unicode-width",
+]
 
 [[package]]
 name = "unicode-width"

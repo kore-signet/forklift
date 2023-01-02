@@ -31,8 +31,10 @@ workers = 2
 filter = { mime_types = ["text/html"] }
 command = "python"
 args = ["scripts/scrape_html.py"] 
+workers = 16
 
 [scripts.links]
 filter = { mime_types = ["text/css"] }
 command = "python"
 args = ["scripts/scrape_css.py"] 
+workers = 1

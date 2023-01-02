@@ -1,13 +1,11 @@
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use async_channel::Receiver as QueueReceiver;
-use async_channel::Sender as QueueSender;
+use async_channel::{Receiver as QueueReceiver, Sender as QueueSender};
 use hyper::Client;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_trust_dns::TrustDnsResolver;
 use prodash::tree::Item as DashboardItem;
+
 use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
 use tokio::task::JoinHandle;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -16,7 +14,7 @@ use crate::client::HttpClient;
 use crate::config::ForkliftConfig;
 use crate::config::HTTPConfig;
 use crate::config::OutputConfig;
-use crate::scripting::ScriptManager;
+
 use crate::warc::WarcRecord;
 use crate::writer::RecordProcessor;
 use crate::writer::WARCFileOutput;
@@ -58,13 +56,13 @@ pub struct ChannelManager {
 
 impl ChannelManager {
     pub fn new(config: &ForkliftConfig) -> ChannelManager {
-        let channel_size = config.http.workers * config.http.tasks_per_worker * 4;
+        let channel_size = config.http.workers * config.http.tasks_per_worker * 8;
         ChannelManager {
             url: QueuePair::new(1024 * 8),
             http_job: QueuePair::new(channel_size),
             response: QueuePair::new(channel_size),
             record: QueuePair::new(channel_size),
-            script: QueuePair::new(channel_size),
+            script: QueuePair::new(1024 * 24),
             script_close: Pair::<WatchSender<bool>, WatchReceiver<bool>>::new(),
         }
     }
@@ -73,7 +71,7 @@ impl ChannelManager {
         self.url.rx.is_empty()
             && self.response.rx.is_empty()
             && self.record.rx.is_empty()
-            && self.script.rx.is_empty()
+            && self.script.tx.is_empty()
             && self.http_job.rx.is_empty()
     }
 }
@@ -238,98 +236,6 @@ impl WriterRunner {
 
     pub async fn join_all(&mut self) -> ForkliftResult<()> {
         futures::future::try_join_all(&mut self.tasks).await?;
-        Ok(())
-    }
-}
-
-pub struct ScriptRunner {
-    total_permits: usize,
-    semaphore: Arc<Semaphore>,
-    rpc_counter: Arc<AtomicUsize>,
-    tasks: JoinSet<ForkliftResult<()>>,
-    _dashboard: DashboardItem,
-}
-
-impl ScriptRunner {
-    pub fn spawn(
-        config: &ForkliftConfig,
-        channels: &ChannelManager,
-        db: &sled::Tree,
-        mut dashboard: DashboardItem,
-    ) -> ForkliftResult<ScriptRunner> {
-        // log::info!("Starting {} script workers", config.script_manager.workers);
-        // log::info!(
-        //     "Selected scripts: {}",
-        //     config
-        //         .scripts
-        //         .keys()
-        //         .map(|v| v.as_str())
-        //         .collect::<Vec<&str>>()
-        //         .join(",")
-        // );
-
-        let semaphore = Arc::new(Semaphore::new(config.script_manager.workers));
-        let rpc_counter = Arc::new(AtomicUsize::new(0));
-        let mut tasks = JoinSet::new();
-
-        for idx in 0..config.script_manager.workers {
-            let task_dash = dashboard.add_child(format!("SCRIPT MANAGER {idx}"));
-
-            let script_rx = channels.script.rx.clone();
-            let script_semaphore = Arc::clone(&semaphore);
-
-            let mut script_close_rx = channels.script_close.rx.clone();
-
-            let mut script_manager = ScriptManager::new(
-                1,
-                channels.url.tx.clone(),
-                channels.http_job.tx.clone(),
-                db.clone(),
-                config.crawl.base_url.clone(),
-                Arc::clone(&rpc_counter),
-                task_dash,
-            );
-
-            for (_, script) in config.scripts.iter() {
-                script_manager.script(script)?;
-            }
-
-            tasks.spawn(async move {
-                loop {
-                    tokio::select! {
-                        Ok(response) = script_rx.recv() => {
-                            let permit = script_semaphore.acquire().await.unwrap();
-                            script_manager.run(&response).await?;
-                            drop(permit);
-                        }
-                        _ = script_close_rx.changed() => {
-                            script_manager.close().await?;
-                            break;
-                        },
-                        else => break
-                    }
-                }
-
-                ForkliftResult::Ok(())
-            });
-        }
-
-        Ok(ScriptRunner {
-            total_permits: config.script_manager.workers,
-            rpc_counter,
-            semaphore,
-            tasks,
-            _dashboard: dashboard,
-        })
-    }
-
-    pub fn is_idle(&self) -> bool {
-        self.semaphore.available_permits() == self.total_permits
-            && self.rpc_counter.load(Ordering::Acquire) == 0
-    }
-
-    pub async fn join_all(&mut self) -> ForkliftResult<()> {
-        while self.tasks.join_next().await.is_some() {}
         Ok(())
     }
 }
