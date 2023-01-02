@@ -54,6 +54,15 @@ async fn inner_main() -> anyhow::Result<()> {
     let (render_fut, render_abort) = futures::future::abortable(dashboard_render);
     tokio::task::spawn(render_fut);
 
+    let mut dashboard_total = dashboard_root.add_child("TOTAL");
+    dashboard_total.init(
+        None,
+        Some(prodash::unit::dynamic_and_mode(
+            prodash::unit::Human::new(prodash::unit::human::Formatter::new(), "records"),
+            prodash::unit::display::Mode::with_throughput(),
+        )),
+    );
+
     let mut config: ForkliftConfig =
         toml::from_str(&tokio::fs::read_to_string(args.config).await?).unwrap();
 
@@ -128,6 +137,8 @@ async fn inner_main() -> anyhow::Result<()> {
         tokio::task::spawn(async move {
             #[allow(unused_must_use)]
             while let Ok(lhs) = response_rx.recv().await {
+                dashboard_total.inc();
+                
                 let rhs = lhs.clone();
                 let script_tx = script_tx.clone();
                 let record_tx = record_tx.clone();
@@ -201,7 +212,7 @@ async fn inner_main() -> anyhow::Result<()> {
 
     render_abort.abort();
 
-    log::info!("Crawl done in {:?}", start.elapsed());
+    println!("Crawl done in {:?}!", start.elapsed());
 
     Ok(())
 }
