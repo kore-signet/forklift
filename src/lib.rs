@@ -1,6 +1,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use governor::{
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+    RateLimiter,
+};
 use hyper::{body::to_bytes, http::response::Parts, Body, Response};
 use tokio::task::JoinError;
 use url::Url;
@@ -15,12 +21,16 @@ pub mod utils;
 pub mod warc;
 pub mod writer;
 
+pub type HttpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
+
 #[derive(thiserror::Error, Debug)]
 pub enum ForkliftError {
     #[error("Body of response is too long")]
     BodyTooLong,
     #[error(transparent)]
     HyperError(#[from] hyper::Error),
+    #[error(transparent)]
+    HyperHttpError(#[from] hyper::http::Error),
     #[error(transparent)]
     IOError(#[from] std::io::Error),
     #[error(transparent)]

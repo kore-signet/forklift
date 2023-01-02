@@ -1,21 +1,54 @@
-use crate::{ForkliftResult, TransferResponse, UrlSource};
+use crate::{ForkliftError, ForkliftResult, HttpRateLimiter, TransferResponse, UrlSource};
 use async_channel::Sender;
 
 use futures::Future;
+use governor::Jitter;
 use hyper::{client::HttpConnector, header::LOCATION, Body, Client, HeaderMap, Request};
 use hyper_rustls::HttpsConnector;
-use std::{sync::Arc, time::Duration};
+use hyper_trust_dns::TrustDnsResolver;
+use prodash::{
+    messages::MessageLevel,
+    tree::Item as DashboardItem,
+    unit::{display::Mode, human::Formatter},
+};
+use std::{fmt::Display, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, task::JoinSet};
 use url::Url;
 
-type HttpsConn = HttpsConnector<HttpConnector>;
+type HttpsConn = HttpsConnector<HttpConnector<TrustDnsResolver>>;
 
 pub struct HttpClient {
     inner: Arc<HttpClientInner>,
-    tasks: JoinSet<ForkliftResult<()>>,
+    tasks: JoinSet<Result<String, HttpFailure>>,
     semaphore: Arc<Semaphore>,
     task_max: usize,
     timeout: Duration,
+    dashboard: DashboardItem,
+    rate_limiter: Arc<HttpRateLimiter>,
+    rate_jitter: Duration,
+}
+
+struct HttpFailure(String, HttpFailureReason);
+impl Display for HttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "couldn't get url {}: {}", self.0, self.1)
+    }
+}
+
+enum HttpFailureReason {
+    Fetch(ForkliftError),
+    Callback(ForkliftError),
+    Timeout,
+}
+
+impl Display for HttpFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpFailureReason::Fetch(e) => write!(f, "fetch failed ({})", e),
+            HttpFailureReason::Callback(e) => write!(f, "result callback failed ({})", e),
+            HttpFailureReason::Timeout => write!(f, "timed out"),
+        }
+    }
 }
 
 impl HttpClient {
@@ -27,14 +60,27 @@ impl HttpClient {
         semaphore: Arc<Semaphore>,
         task_max: usize,
         timeout: Duration,
+        mut dashboard: DashboardItem,
+        rate_limiter: Arc<HttpRateLimiter>,
+        rate_jitter: Duration,
     ) -> HttpClient {
         semaphore.add_permits(task_max);
+        dashboard.init(
+            None,
+            Some(prodash::unit::dynamic_and_mode(
+                prodash::unit::Human::new(Formatter::new(), "urls"),
+                Mode::with_throughput(),
+            )),
+        );
         HttpClient {
             inner: Arc::new(HttpClientInner::new(db, client, url_tx, headers)),
             tasks: JoinSet::new(),
             semaphore,
             task_max,
             timeout,
+            dashboard,
+            rate_limiter,
+            rate_jitter,
         }
     }
 
@@ -43,27 +89,43 @@ impl HttpClient {
         R: Future<Output = ForkliftResult<()>> + Send,
         F: FnOnce(TransferResponse) -> R + Send + 'static,
     {
+        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+
         if self.tasks.len() == self.task_max {
-            self.tasks.join_next().await;
+            match self.tasks.join_next().await.transpose()? {
+                Some(Ok(s)) => self
+                    .dashboard
+                    .message(MessageLevel::Success, format!("fetched {s}")),
+                Some(Err(e)) => self
+                    .dashboard
+                    .message(MessageLevel::Failure, format!("{}", e)),
+                _ => {}
+            }
+            self.dashboard.inc();
         }
 
-        log::debug!(
-            "getting {} | current tasks {}",
-            task.current_url,
-            self.tasks.len()
-        );
+        self.rate_limiter
+            .until_ready_with_jitter(Jitter::up_to(self.rate_jitter))
+            .await;
 
-        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
         let client = Arc::clone(&self.inner);
         let timeout = self.timeout;
         self.tasks.spawn(async move {
             let url = task.current_url.as_str().to_owned();
             match tokio::time::timeout(timeout, client.process_one(task)).await {
-                Ok(v) => callback(v?).await?,
-                Err(_) => log::error!("url {} timed out after {:?}", url, timeout),
-            }
+                Ok(v) => {
+                    callback(
+                        v.map_err(|e| HttpFailure(url.to_owned(), HttpFailureReason::Fetch(e)))?,
+                    )
+                    .await
+                    .map_err(|e| HttpFailure(url.to_owned(), HttpFailureReason::Callback(e)))?;
+                }
+                Err(_) => return Err(HttpFailure(url, HttpFailureReason::Timeout)),
+            };
+
             drop(permit);
-            ForkliftResult::Ok(())
+
+            Ok(url.to_owned())
         });
 
         ForkliftResult::Ok(())
@@ -96,9 +158,7 @@ impl HttpClientInner {
     pub async fn process_one(&self, url: UrlSource) -> ForkliftResult<TransferResponse> {
         let uri_s = url.current_url.to_string();
 
-        let mut request = Request::get(url.current_url.as_str())
-            .body(Body::empty())
-            .unwrap();
+        let mut request = Request::get(url.current_url.as_str()).body(Body::empty())?;
         let headers = request.headers_mut();
         headers.reserve(self.headers.len());
 

@@ -6,6 +6,8 @@ use async_channel::Receiver as QueueReceiver;
 use async_channel::Sender as QueueSender;
 use hyper::Client;
 use hyper_rustls::HttpsConnectorBuilder;
+use hyper_trust_dns::TrustDnsResolver;
+use prodash::tree::Item as DashboardItem;
 use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
 use tokio::task::JoinHandle;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -20,6 +22,7 @@ use crate::writer::RecordProcessor;
 use crate::writer::WARCFileOutput;
 use crate::ForkliftResult;
 use crate::HttpJob;
+use crate::HttpRateLimiter;
 use crate::TransferResponse;
 use crate::UrlSource;
 
@@ -79,6 +82,7 @@ pub struct HttpRunner {
     total_permits: usize,
     pub tasks: JoinSet<ForkliftResult<()>>,
     pub semaphore: Arc<Semaphore>,
+    _dashboard: DashboardItem,
 }
 
 impl HttpRunner {
@@ -86,6 +90,8 @@ impl HttpRunner {
         config: &HTTPConfig,
         channels: &ChannelManager,
         seen_url_db: &sled::Tree,
+        mut dashboard: DashboardItem,
+        rate_limiter: &Arc<HttpRateLimiter>,
     ) -> HttpRunner {
         let semaphore = Arc::new(Semaphore::new(0));
         let mut tasks = JoinSet::new();
@@ -95,16 +101,28 @@ impl HttpRunner {
             config.tasks_per_worker
         );
 
-        for _ in 0..config.workers {
+        for idx in 0..config.workers {
+            let idx_u16 = idx.to_le_bytes();
+            let id = [b'H', b'T', idx_u16[0], idx_u16[1]];
+            let mut dash = dashboard.add_child_with_id(format!("HTTP {idx}"), id);
+            dash.info("Setting up..");
+
+            let (dns_config, mut dns_options) =
+                trust_dns_resolver::system_conf::read_system_conf().unwrap_or_default();
+            dns_options.cache_size = config.dns_cache_size;
+            let mut resolver = TrustDnsResolver::with_config_and_options(dns_config, dns_options)
+                .into_http_connector();
+            resolver.enforce_http(false);
+
             let https_builder = HttpsConnectorBuilder::new()
                 .with_native_roots()
                 .https_or_http()
                 .enable_http1();
 
             let connector = if config.enable_http2 {
-                https_builder.enable_http2().build()
+                https_builder.enable_http2().wrap_connector(resolver)
             } else {
-                https_builder.build()
+                https_builder.wrap_connector(resolver)
             };
 
             let hyper_client = Client::builder().build::<_, hyper::Body>(connector);
@@ -123,6 +141,9 @@ impl HttpRunner {
                 Arc::clone(&semaphore),
                 config.tasks_per_worker,
                 config.request_timeout,
+                dash,
+                Arc::clone(&rate_limiter),
+                config.rate_limiter.jitter,
             );
 
             tasks.spawn(async move {
@@ -152,6 +173,7 @@ impl HttpRunner {
             total_permits: config.workers * config.tasks_per_worker,
             tasks,
             semaphore,
+            _dashboard: dashboard,
         }
     }
 
@@ -165,9 +187,9 @@ impl HttpRunner {
     }
 }
 
-#[repr(transparent)]
 pub struct WriterRunner {
     tasks: Vec<JoinHandle<ForkliftResult<()>>>,
+    _dashboard: DashboardItem,
 }
 
 impl WriterRunner {
@@ -176,26 +198,41 @@ impl WriterRunner {
         channels: &ChannelManager,
         db: &sled::Db,
         output: Arc<std::sync::Mutex<WARCFileOutput>>,
+        mut dashboard: DashboardItem,
     ) -> ForkliftResult<WriterRunner> {
-        log::info!("Starting {} output workers", config.workers);
-
         let mut writer_tasks = Vec::with_capacity(config.workers);
-        let mut writer = RecordProcessor::new(6, db.clone(), Arc::clone(&output))?;
-        let record_rx = channels.record.rx.clone();
 
-        writer_tasks.push(tokio::task::spawn_blocking(move || {
-            while let Ok(response) = record_rx.recv_blocking() {
-                writer.add_record(WarcRecord::from_response(
-                    &response.parts,
-                    response.body,
-                    response.target_url.current_url.as_str(),
-                )?)?;
-            }
-            ForkliftResult::Ok(())
-        }));
+        for idx in 0..config.workers {
+            let mut task_logger = dashboard.add_child(format!("WRITER {idx}"));
+            task_logger.init(
+                None,
+                Some(prodash::unit::dynamic_and_mode(
+                    prodash::unit::Human::new(prodash::unit::human::Formatter::new(), "records"),
+                    prodash::unit::display::Mode::with_throughput(),
+                )),
+            );
+
+            task_logger.info("Starting up...");
+
+            let mut writer = RecordProcessor::new(6, db.clone(), Arc::clone(&output))?;
+            let record_rx = channels.record.rx.clone();
+
+            writer_tasks.push(tokio::task::spawn_blocking(move || {
+                while let Ok(response) = record_rx.recv_blocking() {
+                    writer.add_record(WarcRecord::from_response(
+                        &response.parts,
+                        response.body,
+                        response.target_url.current_url.as_str(),
+                    )?)?;
+                    task_logger.inc();
+                }
+                ForkliftResult::Ok(())
+            }));
+        }
 
         Ok(WriterRunner {
             tasks: writer_tasks,
+            _dashboard: dashboard,
         })
     }
 
@@ -210,6 +247,7 @@ pub struct ScriptRunner {
     semaphore: Arc<Semaphore>,
     rpc_counter: Arc<AtomicUsize>,
     tasks: JoinSet<ForkliftResult<()>>,
+    _dashboard: DashboardItem,
 }
 
 impl ScriptRunner {
@@ -217,23 +255,26 @@ impl ScriptRunner {
         config: &ForkliftConfig,
         channels: &ChannelManager,
         db: &sled::Tree,
+        mut dashboard: DashboardItem,
     ) -> ForkliftResult<ScriptRunner> {
-        log::info!("Starting {} script workers", config.script_manager.workers);
-        log::info!(
-            "Selected scripts: {}",
-            config
-                .scripts
-                .keys()
-                .map(|v| v.as_str())
-                .collect::<Vec<&str>>()
-                .join(",")
-        );
+        // log::info!("Starting {} script workers", config.script_manager.workers);
+        // log::info!(
+        //     "Selected scripts: {}",
+        //     config
+        //         .scripts
+        //         .keys()
+        //         .map(|v| v.as_str())
+        //         .collect::<Vec<&str>>()
+        //         .join(",")
+        // );
 
         let semaphore = Arc::new(Semaphore::new(config.script_manager.workers));
         let rpc_counter = Arc::new(AtomicUsize::new(0));
         let mut tasks = JoinSet::new();
 
-        for _ in 0..config.script_manager.workers {
+        for idx in 0..config.script_manager.workers {
+            let task_dash = dashboard.add_child(format!("SCRIPT MANAGER {idx}"));
+
             let script_rx = channels.script.rx.clone();
             let script_semaphore = Arc::clone(&semaphore);
 
@@ -246,6 +287,7 @@ impl ScriptRunner {
                 db.clone(),
                 config.crawl.base_url.clone(),
                 Arc::clone(&rpc_counter),
+                task_dash,
             );
 
             for (_, script) in config.scripts.iter() {
@@ -277,6 +319,7 @@ impl ScriptRunner {
             rpc_counter,
             semaphore,
             tasks,
+            _dashboard: dashboard,
         })
     }
 

@@ -1,11 +1,13 @@
 use std::{
     borrow::Cow,
     collections::BTreeMap,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
 };
 
+use governor::Quota;
 use hyper::{header::HeaderName, http::HeaderValue, HeaderMap};
 use serde::{
     ser::{SerializeMap, SerializeSeq},
@@ -48,6 +50,8 @@ default_vals! {
         tasks_per_worker: usize = 16;
         request_timeout: std::time::Duration = std::time::Duration::from_secs(60 * 20);
         enable_http2: bool = true;
+        dns_cache_size: usize = 1024;
+        rate_limiter_jitter: std::time::Duration = std::time::Duration::from_secs(1);
     };
     output {
         workers: usize = 4;
@@ -175,6 +179,51 @@ impl Default for ScriptManagerConfig {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitingDuration {
+    Second,
+    Minute,
+    Hour,
+}
+
+impl RateLimitingDuration {
+    pub fn as_duration(&self) -> Duration {
+        match self {
+            RateLimitingDuration::Second => Duration::from_secs(1),
+            RateLimitingDuration::Minute => Duration::from_secs(60),
+            RateLimitingDuration::Hour => Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct RateLimitingConfig {
+    pub n: NonZeroU32,
+    pub per: RateLimitingDuration,
+    #[serde(default = "http::rate_limiter_jitter", with = "humantime_serde")]
+    pub jitter: Duration,
+}
+
+impl Default for RateLimitingConfig {
+    fn default() -> Self {
+        Self {
+            n: NonZeroU32::new(200).unwrap(),
+            per: RateLimitingDuration::Second,
+            jitter: http::rate_limiter_jitter(),
+        }
+    }
+}
+
+impl RateLimitingConfig {
+    pub fn as_quota(&self) -> Quota {
+        let replenish_interval_ns = self.per.as_duration().as_nanos() / (self.n.get() as u128);
+        Quota::with_period(Duration::from_nanos(replenish_interval_ns as u64))
+            .unwrap()
+            .allow_burst(self.n)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct HTTPConfig {
     #[serde(default = "http::workers")]
@@ -191,6 +240,10 @@ pub struct HTTPConfig {
     pub headers: HeaderMap,
     #[serde(default = "http::enable_http2")]
     pub enable_http2: bool,
+    #[serde(default = "http::dns_cache_size")]
+    pub dns_cache_size: usize,
+    #[serde(default)]
+    pub rate_limiter: RateLimitingConfig,
 }
 
 impl Default for HTTPConfig {
@@ -201,6 +254,8 @@ impl Default for HTTPConfig {
             request_timeout: http::request_timeout(),
             headers: HeaderMap::new(),
             enable_http2: http::enable_http2(),
+            dns_cache_size: http::dns_cache_size(),
+            rate_limiter: RateLimitingConfig::default(),
         }
     }
 }

@@ -8,8 +8,10 @@ use forklift::{
     config::ForkliftConfig,
     runner::{ChannelManager, HttpRunner, ScriptRunner, WriterRunner},
     writer::WARCFileOutput,
-    ForkliftResult, UrlSource,
+    ForkliftResult, HttpRateLimiter, UrlSource,
 };
+
+use prodash::Root;
 
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -34,8 +36,23 @@ async fn main() {
 }
 
 async fn inner_main() -> anyhow::Result<()> {
-    pretty_env_logger::init();
+    // pretty_env_logger::init();
     let args = Args::parse();
+
+    let dashboard_root = prodash::tree::Root::new();
+
+    let dashboard_render = prodash::render::tui::render(
+        std::io::stdout(),
+        dashboard_root.downgrade(),
+        prodash::render::tui::Options {
+            title: "forklift crawl".into(),
+            stop_if_progress_missing: false,
+            throughput: true,
+            ..Default::default()
+        },
+    )?;
+    let (render_fut, render_abort) = futures::future::abortable(dashboard_render);
+    tokio::task::spawn(render_fut);
 
     let mut config: ForkliftConfig =
         toml::from_str(&tokio::fs::read_to_string(args.config).await?).unwrap();
@@ -79,9 +96,29 @@ async fn inner_main() -> anyhow::Result<()> {
         config.output.file_size,
     )?));
 
-    let mut http_runner = HttpRunner::spawn(&config.http, &channels, &seen_url_db);
-    let mut writer_runner = WriterRunner::spawn(&config.output, &channels, &db, output)?;
-    let mut script_runner = ScriptRunner::spawn(&config, &channels, &seen_url_db)?;
+    let rate_limiter = Arc::new(HttpRateLimiter::direct(config.http.rate_limiter.as_quota()));
+
+    let mut http_runner = HttpRunner::spawn(
+        &config.http,
+        &channels,
+        &seen_url_db,
+        dashboard_root.add_child("HTTP"),
+        &rate_limiter,
+    );
+
+    let mut writer_runner = WriterRunner::spawn(
+        &config.output,
+        &channels,
+        &db,
+        output,
+        dashboard_root.add_child("OUTPUT"),
+    )?;
+    let mut script_runner = ScriptRunner::spawn(
+        &config,
+        &channels,
+        &seen_url_db,
+        dashboard_root.add_child("SCRIPTING"),
+    )?;
 
     {
         let script_tx = channels.script.tx.clone();
@@ -161,6 +198,8 @@ async fn inner_main() -> anyhow::Result<()> {
     drop(channels);
 
     script_runner.join_all().await?;
+
+    render_abort.abort();
 
     log::info!("Crawl done in {:?}", start.elapsed());
 

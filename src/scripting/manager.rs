@@ -1,6 +1,7 @@
 use async_channel::Sender;
 use futures::{stream::TryStreamExt, StreamExt};
 
+use prodash::tree::Item as DashboardItem;
 use std::{
     process::Stdio,
     sync::{atomic::AtomicUsize, Arc},
@@ -27,6 +28,7 @@ pub struct ScriptManager {
     http_job_tx: Sender<HttpJob>,
     db: sled::Tree,
     rpc_counter: Arc<AtomicUsize>,
+    dashboard: DashboardItem,
 }
 
 impl ScriptManager {
@@ -37,6 +39,7 @@ impl ScriptManager {
         db: sled::Tree,
         base_url: Url,
         rpc_counter: Arc<AtomicUsize>,
+        dashboard: DashboardItem,
     ) -> ScriptManager {
         ScriptManager {
             scripts: Vec::new(),
@@ -46,6 +49,7 @@ impl ScriptManager {
             db,
             base_url,
             rpc_counter,
+            dashboard,
         }
     }
 
@@ -67,6 +71,9 @@ impl ScriptManager {
         let proc_in = BufWriter::new(proc.stdin.take().unwrap());
         let proc_out = BufReader::new(proc.stdout.take().unwrap());
         self.scripts.push(Script {
+            dashboard: self
+                .dashboard
+                .add_child(format!("{} {}", cfg.command, cfg.args.join(" "))),
             max_hops: self.max_hops,
             url_tx: self.url_tx.clone(),
             http_job_tx: self.http_job_tx.clone(),

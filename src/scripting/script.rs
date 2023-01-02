@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use prodash::tree::Item as DashboardItem;
 use tokio::{
     io::{AsyncWriteExt, BufReader, BufWriter},
     process::{Child, ChildStdin, ChildStdout},
@@ -34,6 +35,7 @@ pub struct Script {
     pub(crate) url_tx: QueueSender<UrlSource>,
     pub(crate) http_job_tx: QueueSender<HttpJob>,
     pub(crate) rpc_requests: Arc<AtomicUsize>,
+    pub(crate) dashboard: DashboardItem,
 }
 
 impl Script {
@@ -50,6 +52,17 @@ impl Script {
         if record.body.is_empty() {
             return Ok(());
         }
+
+        let mut logger = self
+            .dashboard
+            .add_child(record.target_url.current_url.as_str());
+        logger.init(
+            None,
+            Some(prodash::unit::dynamic(prodash::unit::Human::new(
+                prodash::unit::human::Formatter::new(),
+                "urls found",
+            ))),
+        );
 
         let mut proc_in = self.proc_in.lock().await;
         proc_in
@@ -77,6 +90,8 @@ impl Script {
                         continue;
                     }
 
+                    logger.inc();
+
                     self.url_tx.send(url).await.unwrap();
                 }
                 ScriptMessage::FileEnd => break,
@@ -102,6 +117,11 @@ impl Script {
                 }
             }
         }
+
+        logger.done(format!(
+            "done scraping url {}",
+            record.target_url.current_url.as_str()
+        ));
 
         Ok(())
     }
